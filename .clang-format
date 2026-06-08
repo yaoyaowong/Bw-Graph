@@ -1,0 +1,42 @@
+# .clang-format configuration file
+---
+Language: Cpp
+BasedOnStyle: LLVM
+
+# Code formatting settings
+AlignAfterOpenBracket: Align        # Align parameters after opening bracket
+AlignConsecutiveMacros: false       # Align consecutive macros
+AlignConsecutiveAssignments: false  # Align consecutive assignments
+AlignOperands: true                # Align operands
+
+# String alignment
+AllowAllParametersOfDeclarationOnNextLine: false   # Do not allow function parameters on the next line
+AlwaysBreakTemplateDeclarations: true               # Always break template declarations
+
+# Indentation and alignment
+ColumnLimit: 100     # Maximum number of characters per line (100)
+IndentWidth: 2       # Indentation width (2 spaces)
+UseTab: Never        # Never use tabs for indentation
+TabWidth: 2          # Tab width (2 spaces)
+IndentAccessModifiers: false
+
+# Space settings
+SpaceBeforeParens: ControlStatements  # Add space before parentheses in control statements
+SpaceAfterCStyleCast: true           # Add space after C-style cast
+SpacesInParentheses: false           # No spaces inside parentheses
+
+# Commas and semicolons
+Cpp11BracedListStyle: true  # Use C++11 style for braced list
+IndentCaseLabels: false     # Do not indent case labels
+
+# Type modifiers (pointers and references)
+PointerAlignment: Left  # Align pointer on the left
+ReferenceAlignment: Left  # Align references on the left
+
+# Macro and function settings
+MacroBlockBegin: ''   # No specific formatting for macro block start
+MacroBlockEnd: ''     # No specific formatting for macro block end
+
+# Include settings
+IncludeBlocks: Regroup      # Regroup includes by category
+SortIncludes: true          # Sort includes within each group

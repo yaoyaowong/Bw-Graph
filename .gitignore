@@ -1,0 +1,232 @@
+# C++ Compiled Object files
+*.slo
+*.lo
+*.o
+*.obj
+
+# C++ Precompiled Headers
+*.gch
+*.pch
+
+# C++ Compiled Dynamic libraries
+*.so
+*.dylib
+*.dll
+*.csv
+*.py
+
+# C++ Fortran module files
+*.mod
+*.smod
+
+# C++ Compiled Static libraries
+*.lai
+*.la
+*.a
+*.lib
+
+# C++ Executables
+*.exe
+*.out
+*.app
+
+# CMake generated files
+CMakeCache.txt
+CMakeFiles/
+CMakeScripts/
+Testing/
+Makefile
+cmake_install.cmake
+install_manifest.txt
+compile_commands.json
+CTestTestfile.cmake
+_deps/
+
+# Build directories
+build/
+Build/
+BUILD/
+debug/
+Debug/
+release/
+Release/
+obj/
+out/
+workspace/
+
+# Visual Studio files
+.vs/
+*.vcxproj*
+*.sln
+*.user
+*.aps
+*.pch
+*.vspscc
+*_i.c
+*_p.c
+*.ncb
+*.suo
+*.tlb
+*.tlh
+*.bak
+*.cache
+*.ilk
+*.log
+*.lib
+*.sbr
+*.sdf
+*.opensdf
+*.unsuccessfulbuild
+ipch/
+*.idb
+*.pgc
+*.pgd
+*.rsp
+*.tmp
+*.est
+
+# Visual Studio Code
+.vscode/
+*.code-workspace
+
+# IntelliJ IDEA / CLion
+.idea/
+*.iws
+*.iml
+*.ipr
+cmake-build-*/
+
+# Eclipse CDT
+.metadata
+.settings/
+.project
+.cproject
+
+# Code::Blocks
+*.cbp
+*.layout
+*.depend
+
+# Dev-C++
+*.dev
+
+# QtCreator
+*.pro.user
+*.pro.user.*
+*.qbs.user
+*.qbs.user.*
+*.moc
+*.qrc.cpp
+qrc_*.cpp
+ui_*.h
+*.qmlc
+*.jsc
+Makefile*
+*build-*
+
+# Xcode
+*.xcodeproj/
+*.xcworkspace/
+DerivedData/
+*.moved-aside
+*.pbxuser
+!default.pbxuser
+*.mode1v3
+!default.mode1v3
+*.mode2v3
+!default.mode2v3
+*.perspectivev3
+!default.perspectivev3
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# Windows
+Thumbs.db
+Thumbs.db:encryptable
+ehthumbs.db
+ehthumbs_vista.db
+Desktop.ini
+$RECYCLE.BIN/
+*.cab
+*.msi
+*.msix
+*.msm
+*.msp
+*.lnk
+
+# Linux
+*~
+.fuse_hidden*
+.directory
+.Trash-*
+.nfs*
+
+# Temporary files
+*.tmp
+*.temp
+*.swp
+*.swo
+*~
+
+# Log files
+*.log
+
+# Package files
+*.tar.gz
+*.zip
+*.7z
+*.rar
+
+# Conan
+conanfile.txt.user
+conaninfo.txt
+conanbuildinfo.cmake
+conan.cmake
+
+# vcpkg
+vcpkg_installed/
+
+# Coverage reports
+*.gcov
+*.gcno
+*.gcda
+coverage/
+coverage.info
+
+# Valgrind
+*.memcheck
+
+# Profiling
+gmon.out
+*.prof
+
+# Documentation generated files
+docs/html/
+docs/latex/
+docs/xml/
+Doxyfile.bak
+
+# Unit test results
+test_results/
+Testing/
+CTestTestfile.cmake
+
+# Cache files
+.cache/
+ccache/
+
+# Backup files
+*.bak
+*.backup
+*.old
+*.orig
+
+/data/*
+!/data/example.graph
+/logs
+/tmp
+/output
