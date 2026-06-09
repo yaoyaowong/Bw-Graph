@@ -56,7 +56,7 @@ bash ./tools/build.sh
 
 5. **Run the example:**
 ```bash
-   ./build/bin/bfs ./config/rn.yaml --algo map --benchmark
+   ./build/bin/bfs ./config/example.yaml --algo map --benchmark
 
    # MySQL MTR Style Testing
    bash ./tools/run_tests.sh read_neighbor_clone
