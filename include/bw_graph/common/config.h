@@ -551,14 +551,14 @@ inline void print_config() {
 /**
  * @brief Apply per-algorithm overrides from command-line arguments.
  *
- * Expects arguments of the form  --key=value  starting at argv[2]
+ * Accepts arguments in --key=value or --key value form starting at argv[2]
  * (argv[0]=program, argv[1]=config file path).
  *
  * Supported keys:
  *   --wcc-algo=sv|map|scan
  *   --bfs-algo=map|scan
  *   --pagerank-algo=map|scan
- *   --cdlp-algo=map|scan
+ *   --cdlp-algo=map|scan|voting
  *   --cdlp-variant=original|voting
  *
  * CLI overrides take precedence over the YAML config file.
@@ -569,18 +569,31 @@ inline void apply_cli_overrides(int argc, char** argv) {
     if (arg.size() < 5 || arg.substr(0, 2) != "--")
       continue;
     auto eq_pos = arg.find('=');
-    if (eq_pos == std::string::npos)
-      continue;
-    std::string key = arg.substr(2, eq_pos - 2);
-    std::string val = arg.substr(eq_pos + 1);
+    std::string key;
+    std::string val;
+    if (eq_pos != std::string::npos) {
+      key = arg.substr(2, eq_pos - 2);
+      val = arg.substr(eq_pos + 1);
+    } else {
+      if (i + 1 >= argc || std::string(argv[i + 1]).rfind("--", 0) == 0)
+        continue;
+      key = arg.substr(2);
+      val = argv[++i];
+    }
     if (key == "wcc-algo")
       bw_graph::BW_GRAPH_WCC_ALGO = val;
     else if (key == "bfs-algo")
       bw_graph::BW_GRAPH_BFS_ALGO = val;
     else if (key == "pagerank-algo" || key == "pr-algo")
       bw_graph::BW_GRAPH_PAGERANK_ALGO = val;
-    else if (key == "cdlp-algo")
-      bw_graph::BW_GRAPH_CDLP_ALGO = val;
+    else if (key == "cdlp-algo") {
+      if (val == "voting") {
+        bw_graph::BW_GRAPH_CDLP_ALGO = "map";
+        bw_graph::BW_GRAPH_CDLP_VARIANT = "voting";
+      } else {
+        bw_graph::BW_GRAPH_CDLP_ALGO = val;
+      }
+    }
     else if (key == "cdlp-variant")
       bw_graph::BW_GRAPH_CDLP_VARIANT = val;
     else if (key == "consolidation-workers")

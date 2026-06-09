@@ -10,6 +10,7 @@
 #include <atomic>
 #include <cstdint>
 #include <folly/concurrency/ConcurrentHashMap.h>
+#include <memory>
 
 struct page_delta_t;
 
@@ -28,9 +29,9 @@ private:
   std::atomic<uint64_t> delta_page_count{0};
 
   /* Forwarding table installed for the duration of an in-flight
-   * consolidation.  nullptr in steady state - writers then take the regular
-   * path with a single atomic acquire-load on the hot path. */
-  std::atomic<page_delta_t*> forwarder_{nullptr};
+   * consolidation. Atomic shared_ptr operations keep it alive for writers
+   * that acquired it before the SMO detached the entry. */
+  std::shared_ptr<page_delta_t> forwarder_;
 
   /* True while an SMO task for this CSR page is queued or running. */
   std::atomic<bool> consolidating_{false};
@@ -62,16 +63,19 @@ public:
   void reset_delta_page_count();
 
   /** Atomically publish a forwarding table for an in-flight consolidation. */
-  void install_forwarder(page_delta_t* fwd) {
-    forwarder_.store(fwd, std::memory_order_release);
+  void install_forwarder(std::shared_ptr<page_delta_t> fwd) {
+    std::atomic_store_explicit(&forwarder_, std::move(fwd), std::memory_order_release);
   }
 
-  /** Atomically retrieve the currently installed forwarder (or nullptr). */
-  page_delta_t* try_get_forwarder() const { return forwarder_.load(std::memory_order_acquire); }
+  /** Atomically acquire shared ownership of the installed forwarder. */
+  std::shared_ptr<page_delta_t> acquire_forwarder() const {
+    return std::atomic_load_explicit(&forwarder_, std::memory_order_acquire);
+  }
 
-  /** Atomically clear the forwarder, returning the previously installed one. */
-  page_delta_t* detach_forwarder() {
-    return forwarder_.exchange(nullptr, std::memory_order_acq_rel);
+  /** Atomically clear the forwarder, returning shared ownership of it. */
+  std::shared_ptr<page_delta_t> detach_forwarder() {
+    return std::atomic_exchange_explicit(&forwarder_, std::shared_ptr<page_delta_t>{},
+                                         std::memory_order_acq_rel);
   }
 
   bool try_begin_consolidation() {
@@ -174,8 +178,9 @@ public:
    * so concurrent writers and the consolidation worker observe the same
    * page_map_entry_t object.
    */
-  void install_forwarder_for(page_no_t csr_page_no, page_delta_t* forwarder);
-  page_delta_t* detach_forwarder_for(page_no_t csr_page_no);
+  void install_forwarder_for(page_no_t csr_page_no, std::shared_ptr<page_delta_t> forwarder);
+  std::shared_ptr<page_delta_t> acquire_forwarder_for(page_no_t csr_page_no) const;
+  std::shared_ptr<page_delta_t> detach_forwarder_for(page_no_t csr_page_no);
 
   /**
    * @brief Claim / release the right to run one SMO task for @p csr_page_no.

@@ -131,9 +131,9 @@ TEST_F(PageDeltaTest, PageMap_InstallGetDetachForwarder) {
 
   // The page has no delta entry yet; install_forwarder_for must materialise
   // an empty entry on the fly so concurrent writers can observe it.
-  page_delta_t pd;
-  pd.forward_map_.emplace(0, 42);
-  pmt->install_forwarder_for(pno, &pd);
+  auto pd = std::make_shared<page_delta_t>();
+  pd->forward_map_.emplace(0, 42);
+  pmt->install_forwarder_for(pno, pd);
 
   // A writer would discover the forwarder via insert_delta_with_forward:
   // rerouted == true and the record lands on the forwarded target.
@@ -144,13 +144,40 @@ TEST_F(PageDeltaTest, PageMap_InstallGetDetachForwarder) {
   (void) d_pno;
   (void) d_idx;
 
-  page_delta_t* taken = pmt->detach_forwarder_for(pno);
-  EXPECT_EQ(taken, &pd);
+  std::shared_ptr<page_delta_t> taken = pmt->detach_forwarder_for(pno);
+  EXPECT_EQ(taken, pd);
 
   // After detach, a second writer must take the regular (non-rerouted) path.
   bool rerouted2 = false;
   pmt->insert_delta_with_forward(pno, 0, rec, rerouted2);
   EXPECT_FALSE(rerouted2);
+}
+
+TEST_F(PageDeltaTest, PageMap_DetachKeepsInFlightForwarderAlive) {
+  adj_map_t g;
+  g[0] = {1};
+  g[1] = {};
+  auto [frame, pno] = make_csr_page(g);
+  (void) frame;
+
+  auto forwarder = std::make_shared<page_delta_t>();
+  forwarder->forward_map_.emplace(0, 42);
+  std::weak_ptr<page_delta_t> lifetime = forwarder;
+  pmt->install_forwarder_for(pno, forwarder);
+
+  std::shared_ptr<page_delta_t> in_flight = pmt->acquire_forwarder_for(pno);
+  ASSERT_EQ(in_flight, forwarder);
+
+  EXPECT_EQ(pmt->detach_forwarder_for(pno), forwarder);
+  forwarder.reset();
+  EXPECT_FALSE(lifetime.expired());
+
+  page_no_t target = 0;
+  EXPECT_TRUE(in_flight->lookup_forward(0, target));
+  EXPECT_EQ(target, 42u);
+
+  in_flight.reset();
+  EXPECT_TRUE(lifetime.expired());
 }
 
 // Drive the full Phase A -> reroute -> Phase C handshake by hand and assert
@@ -174,11 +201,11 @@ TEST_F(PageDeltaTest, Finalize_TruncatesBoundaryRecord) {
   // Phase A (install forwarder) AFTER new_pno is known. Until this point,
   // vertex_index still points at old_pno; the forwarder maps every merged
   // vertex onto new_pno.
-  auto forwarder = std::make_unique<page_delta_t>();
+  auto forwarder = std::make_shared<page_delta_t>();
   for (const auto& [v_id, loc] : new_locations) {
     forwarder->forward_map_.emplace(v_id, loc.first);
   }
-  pmt->install_forwarder_for(old_pno, forwarder.get());
+  pmt->install_forwarder_for(old_pno, forwarder);
 
   // Simulate a concurrent writer that observes the forwarder via the
   // page_map and prepends a delta onto the new chain.  Inject a fake
@@ -248,11 +275,11 @@ TEST_F(PageDeltaTest, Finalize_NoWriter_ResetsHeads) {
   page_no_t new_pno = smo->test_do_no_split(old_pno, merged_graph, csr_disk_mgr, csr_pool, sketch,
                                             vertex_index, new_locations);
 
-  auto forwarder = std::make_unique<page_delta_t>();
+  auto forwarder = std::make_shared<page_delta_t>();
   for (const auto& [v_id, loc] : new_locations) {
     forwarder->forward_map_.emplace(v_id, loc.first);
   }
-  pmt->install_forwarder_for(old_pno, forwarder.get());
+  pmt->install_forwarder_for(old_pno, forwarder);
 
   smo->test_finalize_consolidation(new_locations, pmt, vertex_index, forwarder.get());
 

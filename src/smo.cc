@@ -22,7 +22,10 @@
 #include <utility>
 
 // Construct smo_ctl_t.
-smo_ctl_t::smo_ctl_t(size_t max_threads) : max_threads_(max_threads), pending_consolidations_(0) {
+smo_ctl_t::smo_ctl_t(size_t max_threads, bool manual_version_switch)
+    : max_threads_(max_threads),
+      pending_consolidations_(0),
+      manual_version_switch_(manual_version_switch) {
   // max_threads == 0 disables consolidation entirely: skip arena/task_group
   // allocation so that no background SMO worker exists.
   if (max_threads_ == 0) {
@@ -33,12 +36,33 @@ smo_ctl_t::smo_ctl_t(size_t max_threads) : max_threads_(max_threads), pending_co
 }
 
 // Destroy smo_ctl_t.
-smo_ctl_t::~smo_ctl_t() { wait_all_consolidations(); }
+smo_ctl_t::~smo_ctl_t() { publish_pending_versions(); }
 
 // Wait all consolidations.
 void smo_ctl_t::wait_all_consolidations() {
   if (task_group_) {
     task_group_->wait();
+  }
+}
+
+void smo_ctl_t::publish_pending_versions() {
+  wait_all_consolidations();
+
+  std::vector<pending_version_switch_t> pending;
+  {
+    std::lock_guard<std::mutex> guard(pending_version_switches_mutex_);
+    pending.swap(pending_version_switches_);
+  }
+
+  folly::F14FastSet<vertex_index_t*> vertex_indexes;
+  for (auto& version_switch : pending) {
+    vertex_indexes.insert(version_switch.vertex_index);
+    publish_version_switch(version_switch);
+  }
+  for (vertex_index_t* vertex_index : vertex_indexes) {
+    if (vertex_index != nullptr) {
+      vertex_index->wait_for_version_gc();
+    }
   }
 }
 
@@ -446,6 +470,46 @@ void smo_ctl_t::finalize_consolidation(vertex_location_map_t& new_locations,
   }
 }
 
+void smo_ctl_t::publish_version_switch(pending_version_switch_t& pending) {
+  auto reclaim_batch = std::make_shared<vertex_version_reclaim_batch_t>(
+      pending.new_locations.size(),
+      [old_page_no = pending.old_page_no, disk_manager = pending.disk_manager,
+       buf_pool = pending.buf_pool] {
+        while (!buf_pool->retire_page(old_page_no)) {
+          std::this_thread::sleep_for(std::chrono::microseconds(50));
+        }
+        disk_manager->delete_page(old_page_no);
+      });
+
+  finalize_consolidation(pending.new_locations, pending.page_map, pending.vertex_index,
+                         pending.forwarder.get(), pending.giant_vertices, reclaim_batch);
+
+  pending.page_map->detach_forwarder_for(pending.old_page_no);
+
+  if (!pending.need_split) {
+    if (index_page_map_ != nullptr && pending.old_parent_no != 0) {
+      update_index_no_split(pending.old_page_no, pending.single_new_csr_no,
+                            pending.old_parent_no);
+    }
+  } else if (index_page_map_ != nullptr && pending.old_parent_no != 0 &&
+             !pending.new_page_nos.empty()) {
+    update_index_split(pending.old_page_no, pending.old_parent_no, pending.new_page_nos,
+                       pending.merged_graph, pending.vertex_index);
+  }
+
+#ifdef BW_GRAPH_ENABLE_TRANSACTION
+  if (pending.set_page_snapshot_ts) {
+    for (page_no_t page_no : pending.new_page_nos) {
+      csr_page_t* page = pending.buf_pool->buf_page_read(page_no, pending.disk_manager);
+      page->set_page_snapshot_ts(pending.page_snapshot_ts);
+      page->r_unlatch();
+    }
+  }
+#endif
+
+  pending.forwarder.reset();
+}
+
 void smo_ctl_t::update_index_no_split(page_no_t old_csr_page_no, page_no_t new_csr_page_no,
                                       page_no_t old_parent_no) {
   std::lock_guard<std::mutex> lock(index_mutex_);
@@ -826,58 +890,14 @@ void smo_ctl_t::consolidate_pages(csr_page_t* old_page, page_map_t* page_map,
   // Install the forwarding table on the OLD page_map entry BEFORE we publish
   // the new vertex_index entries.  Putting it on the page_map_entry lets
   // concurrent writers observe the forwarder with the SAME ConcurrentHashMap
-  // probe they already need for insert_delta, so the steady-state hot path
-  // costs only a single atomic acquire-load (= forwarder == nullptr).
-  std::unique_ptr<page_delta_t> forwarder = std::make_unique<page_delta_t>();
+  // probe they already need for insert_delta. Shared ownership keeps the
+  // table alive until every writer that observed it has finished.
+  auto forwarder = std::make_shared<page_delta_t>();
   forwarder->forward_map_.reserve(new_locations.size());
   for (const auto& [v_id, loc] : new_locations) {
     forwarder->forward_map_.emplace(v_id, loc.first);
   }
-  page_map->install_forwarder_for(old_page_no, forwarder.get());
-
-  auto reclaim_batch = std::make_shared<vertex_version_reclaim_batch_t>(
-      new_locations.size(), [old_page_no, disk_manager, buf_pool] {
-        while (!buf_pool->retire_page(old_page_no)) {
-          std::this_thread::sleep_for(std::chrono::microseconds(50));
-        }
-        disk_manager->delete_page(old_page_no);
-      });
-
-  // Atomic finalize: update vertex_index, fix boundary records, publish heads.
-  finalize_consolidation(new_locations, page_map, vertex_index, forwarder.get(), giant_vertices,
-                         reclaim_batch);
-
-  // Forwarder lifetime ends here; readers from now on observe the post-
-  // consolidation vertex_index directly and never touch the forwarder.
-  page_map->detach_forwarder_for(old_page_no);
-  forwarder.reset();
-
-  // Maintain the TAT now that vertex_index points at the new pages.
-  if (!need_split) {
-    if (index_page_map_ != nullptr && old_parent_no != 0) {
-      update_index_no_split(old_page_no, single_new_csr_no, old_parent_no);
-    }
-#ifdef BW_GRAPH_ENABLE_TRANSACTION
-    if (txn_manager_ != nullptr) {
-      csr_page_t* np = buf_pool->buf_page_read(single_new_csr_no, disk_manager);
-      np->set_page_snapshot_ts(txn_watermark);
-      np->r_unlatch();
-    }
-#endif
-  } else {
-    if (index_page_map_ != nullptr && old_parent_no != 0 && !new_page_nos.empty()) {
-      update_index_split(old_page_no, old_parent_no, new_page_nos, merged_graph, vertex_index);
-    }
-#ifdef BW_GRAPH_ENABLE_TRANSACTION
-    if (txn_manager_ != nullptr) {
-      for (page_no_t pno : new_page_nos) {
-        csr_page_t* np = buf_pool->buf_page_read(pno, disk_manager);
-        np->set_page_snapshot_ts(txn_watermark);
-        np->r_unlatch();
-      }
-    }
-#endif
-  }
+  page_map->install_forwarder_for(old_page_no, forwarder);
 
   // Drain stray deltas and reroute them to the new CSR pages.  Strays are
   // records written between fetch_deltas_with_mark and the forwarder being
@@ -892,7 +912,10 @@ void smo_ctl_t::consolidate_pages(csr_page_t* old_page, page_map_t* page_map,
     if (delta.target != EDGE) {
       continue;
     }
-    vertex_loc_t new_loc = vertex_index->get_vertex_location(delta.first);
+    auto new_loc_it = new_locations.find(delta.first);
+    if (new_loc_it == new_locations.end()) {
+      throw std::runtime_error("SMO stray delta source is missing from replacement pages");
+    }
 
     // Acquire the vertex write latch to safely prepend into delta_heads_.
     vertex_index->v_w_lock(delta.first);
@@ -901,11 +924,41 @@ void smo_ctl_t::consolidate_pages(csr_page_t* old_page, page_map_t* page_map,
     delta.next_page_no = cur_head.page_no;
     delta.next_record_idx = cur_head.record_idx;
 
-    auto [d_page_no, d_record_idx] = page_map->insert_delta_and_get_loc(new_loc.first, delta);
+    auto [d_page_no, d_record_idx] =
+        page_map->insert_delta_and_get_loc(new_loc_it->second.first, delta);
 
     vertex_index->delta_heads_[delta.first] = {d_page_no, d_record_idx};
+    forwarder->note_rerouted_tail(delta.first, {d_page_no, d_record_idx});
 
     vertex_index->v_w_unlock(delta.first);
+  }
+
+  pending_version_switch_t pending;
+  pending.new_locations = std::move(new_locations);
+  pending.forwarder = std::move(forwarder);
+  pending.giant_vertices = std::move(giant_vertices);
+  pending.page_map = page_map;
+  pending.disk_manager = disk_manager;
+  pending.buf_pool = buf_pool;
+  pending.vertex_index = vertex_index;
+  pending.old_page_no = old_page_no;
+  pending.old_parent_no = old_parent_no;
+  pending.need_split = need_split;
+  pending.single_new_csr_no = single_new_csr_no;
+  pending.new_page_nos = std::move(new_page_nos);
+  if (need_split && index_page_map_ != nullptr && old_parent_no != 0) {
+    pending.merged_graph = std::move(merged_graph);
+  }
+#ifdef BW_GRAPH_ENABLE_TRANSACTION
+  pending.set_page_snapshot_ts = txn_manager_ != nullptr;
+  pending.page_snapshot_ts = txn_watermark;
+#endif
+
+  if (manual_version_switch_) {
+    std::lock_guard<std::mutex> guard(pending_version_switches_mutex_);
+    pending_version_switches_.push_back(std::move(pending));
+  } else {
+    publish_version_switch(pending);
   }
 
   {

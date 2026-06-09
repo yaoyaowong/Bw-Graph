@@ -41,7 +41,8 @@
 
 // Construct bw_graph_db_t.
 bw_graph_db_t::bw_graph_db_t(const std::string& graph_name, bool rebuild, bool re_part,
-                             bool compressed, bool id_aware, bool coarsening, bool reordered) {
+                             bool compressed, bool id_aware, bool coarsening, bool reordered,
+                             bool manual_version_switch) {
   // Step 1. Initialize basic components
   this->graph_name_ = graph_name;
   bw_graph::ensure_storage_prefixes();
@@ -58,7 +59,8 @@ bw_graph_db_t::bw_graph_db_t(const std::string& graph_name, bool rebuild, bool r
       bw_graph::BW_DELTA_PAGE_SIZE);
 
   this->page_map_table = new page_map_t(this->delta_buffer_pool, this->delta_disk_manager);
-  this->smo_ctl = new smo_ctl_t(bw_graph::BW_GRAPH_CONSOLIDATION_WORKER_COUNT);
+  this->smo_ctl =
+      new smo_ctl_t(bw_graph::BW_GRAPH_CONSOLIDATION_WORKER_COUNT, manual_version_switch);
 
   // Start the background delta-page flusher.
   // Both the interval and worker count must be positive; either set to 0
@@ -172,7 +174,7 @@ void bw_graph_db_t::close() {
   closed_ = true;
 
   if (smo_ctl != nullptr) {
-    smo_ctl->wait_all_consolidations();
+    smo_ctl->publish_pending_versions();
     smo_ctl->set_csr_flusher(nullptr);
   }
 

@@ -44,6 +44,9 @@ private:
   /* Number of queued or running consolidations. */
   std::atomic<size_t> pending_consolidations_{0};
 
+  /** Defer vertex-version publication until explicitly requested. */
+  bool manual_version_switch_{false};
+
   /** Optional CSR flusher to trigger after each successful SMO. */
   csr_flusher_t* csr_flusher_{nullptr};
 
@@ -69,6 +72,35 @@ private:
 
   /** Protects pending_retired_pages_. */
   std::mutex retired_pages_mutex_;
+
+  /** Vertex -> prepared immutable version for one SMO publication. */
+  using vertex_location_map_t = folly::F14FastMap<v_id_t, prepared_vertex_version_t>;
+
+  struct pending_version_switch_t {
+    vertex_location_map_t new_locations;
+    std::shared_ptr<page_delta_t> forwarder;
+    folly::F14FastSet<v_id_t> giant_vertices;
+    page_map_t* page_map{nullptr};
+    disk_manager_t* disk_manager{nullptr};
+    buf_pool_t<csr_page_t>* buf_pool{nullptr};
+    vertex_index_t* vertex_index{nullptr};
+    page_no_t old_page_no{0};
+    page_no_t old_parent_no{0};
+    bool need_split{false};
+    page_no_t single_new_csr_no{0};
+    std::vector<page_no_t> new_page_nos;
+    adj_map_t merged_graph;
+#ifdef BW_GRAPH_ENABLE_TRANSACTION
+    bool set_page_snapshot_ts{false};
+    timestamp_t page_snapshot_ts{INVALID_TS};
+#endif
+  };
+
+  /** Consolidations built but not yet published in manual mode. */
+  std::vector<pending_version_switch_t> pending_version_switches_;
+
+  /** Protects pending_version_switches_. */
+  std::mutex pending_version_switches_mutex_;
 
   /**
    * @brief Submit a void task into the SMO runtime.
@@ -134,9 +166,6 @@ private:
    * @brief Retry all deferred CSR page recycle candidates.
    */
   void retry_deferred_recycles(disk_manager_t* disk_manager, buf_pool_t<csr_page_t>* buf_pool);
-
-  /** Vertex -> prepared immutable version for one SMO publication. */
-  using vertex_location_map_t = folly::F14FastMap<v_id_t, prepared_vertex_version_t>;
 
   /**
    * @brief No-split CoW: build ONE new CSR page for merged_graph and copy it
@@ -209,6 +238,11 @@ private:
                               vertex_index_t* vertex_index, page_delta_t* forwarder,
                               const folly::F14FastSet<v_id_t>& giant_vertices,
                               const std::shared_ptr<vertex_version_reclaim_batch_t>& reclaim_batch);
+
+  /**
+   * @brief Publish one staged consolidation and recycle its old CSR page.
+   */
+  void publish_version_switch(pending_version_switch_t& pending);
 
   /**
    * @brief COW update: replace old_csr_page_no with new_csr_page_no in parent
@@ -284,7 +318,7 @@ public:
    * @param max_threads Maximum SMO worker count.
    * @return None.
    */
-  explicit smo_ctl_t(size_t max_threads = 4);
+  explicit smo_ctl_t(size_t max_threads = 4, bool manual_version_switch = false);
 
   /**
    * @brief Destroy SMO controller and wait all pending tasks.
@@ -371,6 +405,16 @@ public:
    * @return None.
    */
   void wait_all_consolidations();
+
+  /**
+   * @brief Publish all replacement pages staged by manual-version SMO.
+   *
+   * Callers must stop graph writers before invoking this method.
+   */
+  void publish_pending_versions();
+
+  /** Return whether this controller defers vertex-version publication. */
+  bool manual_version_switch_enabled() const { return manual_version_switch_; }
 
   /**
    * @brief Get current pending consolidation count.

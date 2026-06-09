@@ -295,6 +295,9 @@ void bw_graph_db_t::consolidate_all_pages() {
 // Wait for pending consolidations.
 void bw_graph_db_t::wait_for_pending_consolidations() { this->smo_ctl->wait_all_consolidations(); }
 
+// Publish all versions staged by manual-switch SMO.
+void bw_graph_db_t::force_switch_new_version() { this->smo_ctl->publish_pending_versions(); }
+
 // Delete vertex.
 bool bw_graph_db_t::delete_vertex(v_id_t vertex_id, bool remove_neighbors) {
   // Step 1. Check vertex exists.

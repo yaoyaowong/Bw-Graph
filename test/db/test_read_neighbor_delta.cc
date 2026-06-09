@@ -58,3 +58,10 @@ TEST(ReadNeighborWithDeltaTest, SnapshotExposesDeltaHeadAndCloneAppliesNewestRec
 
   EXPECT_EQ(sorted(db.read_neighbor_clone(0)), (std::vector<v_id_t>{1, 2, 3}));
 }
+
+TEST(ReadNeighborWithDeltaTest, ManualVersionSwitchIsSafeWithoutPendingConsolidations) {
+  bw_graph_db_t db(make_test_graph(), true, true, false, false, false, false, true);
+
+  EXPECT_NO_THROW(db.force_switch_new_version());
+  EXPECT_EQ(sorted(db.read_neighbor_clone(0)), (std::vector<v_id_t>{1, 2}));
+}

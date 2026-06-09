@@ -262,10 +262,11 @@ public:
    * @param id_aware Whether to use ID-aware sequential storage
    * @param coarsening Whether to apply coarsening during partitioning
    * @param reordered Whether the graph should be reordered
+   * @param manual_version_switch Whether SMO versions require explicit publication
    */
   bw_graph_db_t(const std::string& graph_name, bool rebuild = true, bool re_part = false,
                 bool compressed = false, bool id_aware = false, bool coarsening = true,
-                bool reordered = false);
+                bool reordered = false, bool manual_version_switch = false);
 
   ~bw_graph_db_t();
 
@@ -474,6 +475,13 @@ public:
    * @brief Wait for all pending consolidation operations to complete
    */
   void wait_for_pending_consolidations();
+
+  /**
+   * @brief Publish all SMO versions staged in manual version-switch mode.
+   *
+   * Callers must stop concurrent writers before invoking this method.
+   */
+  void force_switch_new_version();
 
   /**
    * @brief Synchronously flush all dirty delta pages to disk.

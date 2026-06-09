@@ -53,12 +53,12 @@ algorithms:
     max_iteration: 100
     algo: sv          # sv | scan | map | sequential
   pagerank:
-    max_iteration: 10
+    max_iteration: 5
     damping_factor: 0.85
     convergence_threshold: 1e-2
     algo: map         # scan | map | sequential
   cdlp:
-    max_iteration: 10
+    max_iteration: 5
     algo: scan         # scan | map | sequential
     variant: original # original | voting  (only when algo: map)
   sample:
@@ -69,10 +69,10 @@ thread:
   # consolidation_workers: number of background SMO worker threads.
   #   > 0: enable async consolidation with the given thread budget.
   #   = 0: disable consolidation; delta chains are never consolidated.
-  consolidation_workers: 4
+  consolidation_workers: 1
   # version_gc_thd_count: background workers that retire old vertex-index
   # versions through Folly hazard pointers. Must be at least 1.
-  version_gc_thd_count: 2
+  version_gc_thd_count: 1
 
 graph:
   name: example

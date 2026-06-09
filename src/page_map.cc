@@ -225,10 +225,10 @@ std::pair<page_no_t, uint32_t> page_map_t::insert_delta_with_forward(page_no_t c
   // One ConcurrentHashMap probe serves both purposes: locate the source
   // entry AND, when consolidation is in flight, look up the forwarder.
   page_no_t target_pno = csr_page_no;
-  page_delta_t* forwarder = nullptr;
+  std::shared_ptr<page_delta_t> forwarder;
   auto src_entry = page_map_inner.find(csr_page_no);
   if (src_entry != page_map_inner.end()) {
-    forwarder = src_entry->second->try_get_forwarder();
+    forwarder = src_entry->second->acquire_forwarder();
     if (forwarder != nullptr) {
       page_no_t new_pno = 0;
       if (forwarder->lookup_forward(src, new_pno)) {
@@ -247,10 +247,11 @@ std::pair<page_no_t, uint32_t> page_map_t::insert_delta_with_forward(page_no_t c
 }
 
 // Install a forwarder on the entry for @p csr_page_no.
-void page_map_t::install_forwarder_for(page_no_t csr_page_no, page_delta_t* forwarder) {
+void page_map_t::install_forwarder_for(page_no_t csr_page_no,
+                                       std::shared_ptr<page_delta_t> forwarder) {
   auto it = page_map_inner.find(csr_page_no);
   if (it != page_map_inner.end()) {
-    it->second->install_forwarder(forwarder);
+    it->second->install_forwarder(std::move(forwarder));
     return;
   }
   // No entry yet (no delta has been inserted on this page).  Materialise an
@@ -262,15 +263,24 @@ void page_map_t::install_forwarder_for(page_no_t csr_page_no, page_delta_t* forw
   if (!inserted) {
     // Another writer raced us; install on the winning entry and drop ours.
     delete new_entry;
-    emplaced_it->second->install_forwarder(forwarder);
+    emplaced_it->second->install_forwarder(std::move(forwarder));
   }
 }
 
-// Detach the forwarder on the entry for @p csr_page_no.
-page_delta_t* page_map_t::detach_forwarder_for(page_no_t csr_page_no) {
+// Acquire shared ownership of the forwarder on @p csr_page_no.
+std::shared_ptr<page_delta_t> page_map_t::acquire_forwarder_for(page_no_t csr_page_no) const {
   auto it = page_map_inner.find(csr_page_no);
   if (it == page_map_inner.end()) {
-    return nullptr;
+    return {};
+  }
+  return it->second->acquire_forwarder();
+}
+
+// Detach the forwarder on the entry for @p csr_page_no.
+std::shared_ptr<page_delta_t> page_map_t::detach_forwarder_for(page_no_t csr_page_no) {
+  auto it = page_map_inner.find(csr_page_no);
+  if (it == page_map_inner.end()) {
+    return {};
   }
   return it->second->detach_forwarder();
 }

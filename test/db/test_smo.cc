@@ -8,6 +8,7 @@
 #include "bw_graph/io/io_csr.h"
 #include "bw_graph/io/io_delta.h"
 #include "bw_graph/io/io_index.h"
+#include "bw_graph/part/page_delta.h"
 #include "bw_graph/part/smo.h"
 #include "bw_graph/storage/disk_manager.h"
 
@@ -198,6 +199,38 @@ TEST_F(SmoTest, NoSplit_VertexIndexUpdated) {
   auto nbrs2 = read_neighbors(2);
   EXPECT_NE(std::find(nbrs2.begin(), nbrs2.end(), 4u), nbrs2.end())
       << "delta edge v2→v4 must be visible after consolidation";
+}
+
+TEST_F(SmoTest, ManualVersionSwitchPublishesOnlyOnDemand) {
+  delete smo;
+  smo = new smo_ctl_t(1, true);
+
+  adj_map_t initial;
+  initial[0] = {1};
+  initial[1] = {0};
+  auto [old_frame, old_pno] = make_csr_page(initial);
+
+  push_edge_delta(old_pno, 0, 2);
+  smo->consolidate_pages(old_frame, pmt, csr_disk_mgr, csr_pool, vertex_index, nullptr, sketch);
+
+  EXPECT_EQ(vertex_index->get_vertex_location(0).first, old_pno);
+  EXPECT_EQ(read_neighbors(0), std::vector<v_id_t>({1}));
+
+  auto forwarder = pmt->acquire_forwarder_for(old_pno);
+  ASSERT_NE(forwarder, nullptr);
+  page_no_t staged_pno = old_pno;
+  ASSERT_TRUE(forwarder->lookup_forward(0, staged_pno));
+  EXPECT_NE(staged_pno, old_pno);
+
+  smo->publish_pending_versions();
+
+  EXPECT_EQ(vertex_index->get_vertex_location(0).first, staged_pno);
+  EXPECT_EQ(read_neighbors(0), std::vector<v_id_t>({1, 2}));
+  EXPECT_EQ(pmt->acquire_forwarder_for(old_pno), nullptr);
+
+  page_no_t recycled_pno =
+      static_cast<page_no_t>(csr_disk_mgr->allocate_page() / bw_graph::BW_GRAPH_PAGE_SIZE);
+  EXPECT_EQ(recycled_pno, old_pno);
 }
 
 // Test SmoTest.no split edge delete applied.
