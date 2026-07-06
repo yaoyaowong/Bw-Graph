@@ -61,3 +61,29 @@ TEST(BufFreeTest, TraversalFreeTest) {
   });
   EXPECT_EQ(count, 20); // 2 chunks * 10 pages each
 }
+
+namespace {
+
+class zero_disk_manager_t : public disk_manager_t {
+public:
+  void read_page(page_no_t, char* page_data) override {
+    std::memset(page_data, 0, bw_graph::BW_GRAPH_PAGE_SIZE);
+  }
+
+  void write_page(page_no_t, const char*) override {}
+};
+
+} // namespace
+
+TEST(BufPoolTest, ReadLatchPinsPageUntilReleased) {
+  auto* buf_pool = buf_pool_t<csr_page_t>::buf_pool_init(1, 1, bw_graph::BW_GRAPH_PAGE_SIZE);
+  zero_disk_manager_t disk_manager;
+
+  csr_page_t* page = buf_pool->buf_page_read(0, &disk_manager);
+  EXPECT_GT(page->get_pin_count(), 0);
+
+  page->r_unlatch();
+  EXPECT_EQ(page->get_pin_count(), 0);
+
+  delete buf_pool;
+}

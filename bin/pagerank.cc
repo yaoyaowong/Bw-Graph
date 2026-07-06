@@ -45,6 +45,7 @@ int main(int argc, char* argv[]) {
     }
   }
 
+  apply_memory_cli_override(argc, argv);
   bw_graph::BW_GRAPH_PAGERANK_ALGO = algo;
   bw_graph::BW_GRAPH_PAGERANK_MAX_ITERATION = max_iterations;
   bw_graph::BW_GRAPH_PAGERANK_DAMPING_FACTOR = damping_factor;

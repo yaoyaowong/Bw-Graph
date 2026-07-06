@@ -1,5 +1,6 @@
 #ifndef BW_GRAPH_ALGO_CLI
 #define BW_GRAPH_ALGO_CLI
+#include "bw_graph/common/config.h"
 #include "bw_graph/common/type.h"
 
 #include <chrono>
@@ -58,6 +59,22 @@ inline bool read_cli_value(int argc, char** argv, int& index, const std::string&
                            const std::string& short_name, std::string& value) {
   return read_cli_value(argc, argv, index, long_name, value) ||
          read_cli_value(argc, argv, index, short_name, value);
+}
+
+inline bool apply_memory_cli_override(int argc, char** argv) {
+  bool applied = false;
+  for (int i = 1; i < argc; ++i) {
+    if (is_config_path_arg(argc, argv, i)) {
+      continue;
+    }
+    std::string value;
+    if (read_cli_value(argc, argv, i, "--mem", value)) {
+      apply_buffer_pool_memory_budget_mb(
+          static_cast<uint64_t>(std::strtoull(value.c_str(), nullptr, 10)));
+      applied = true;
+    }
+  }
+  return applied;
 }
 
 /**

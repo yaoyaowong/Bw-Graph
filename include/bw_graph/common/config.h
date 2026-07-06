@@ -9,6 +9,7 @@
 #include <filesystem>
 #include <iomanip>
 #include <iostream>
+#include <limits>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -548,6 +549,27 @@ inline void print_config() {
   std::cout << std::string(80, '=') << std::endl;
 }
 
+inline void apply_buffer_pool_memory_budget_mb(uint64_t mem_mb) {
+  constexpr uint64_t bytes_per_mb = 1024ULL * 1024ULL;
+  const uint64_t page_size =
+      static_cast<uint64_t>(std::max<size_t>(bw_graph::BW_GRAPH_PAGE_SIZE, 1));
+  uint64_t budget_bytes = 0;
+  if (mem_mb > std::numeric_limits<uint64_t>::max() / bytes_per_mb) {
+    budget_bytes = std::numeric_limits<uint64_t>::max();
+  } else {
+    budget_bytes = mem_mb * bytes_per_mb;
+  }
+
+  uint64_t resident_pages = budget_bytes / page_size;
+  if (resident_pages == 0) {
+    resident_pages = 1;
+  }
+
+  bw_graph::BW_BUFFER_CHUNK_COUNT = std::min<uint64_t>(16, resident_pages);
+  bw_graph::BW_BUFFER_CHUNK_SIZE =
+      std::max<uint64_t>(1, resident_pages / bw_graph::BW_BUFFER_CHUNK_COUNT);
+}
+
 /**
  * @brief Apply per-algorithm overrides from command-line arguments.
  *
@@ -560,6 +582,7 @@ inline void print_config() {
  *   --pagerank-algo=map|scan
  *   --cdlp-algo=map|scan|voting
  *   --cdlp-variant=original|voting
+ *   --mem=MB
  *
  * CLI overrides take precedence over the YAML config file.
  */
@@ -604,6 +627,8 @@ inline void apply_cli_overrides(int argc, char** argv) {
       bw_graph::BW_DELTA_FLUSH_WORKER_COUNT = static_cast<uint64_t>(std::stoll(val));
     else if (key == "csr-flush-workers")
       bw_graph::BW_CSR_FLUSH_WORKER_COUNT = static_cast<uint64_t>(std::stoll(val));
+    else if (key == "mem")
+      apply_buffer_pool_memory_budget_mb(static_cast<uint64_t>(std::stoull(val)));
     else
       std::cerr << "[Config] Unknown CLI override key: --" << key << std::endl;
   }

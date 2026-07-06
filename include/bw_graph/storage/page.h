@@ -147,17 +147,26 @@ public:
   /**
    * @brief Acquire the page read latch (shared access)
    */
-  void r_latch() { rw_latch_.r_lock(); }
+  void r_latch() {
+    inc_pin_count();
+    rw_latch_.r_lock();
+  }
 
   /**
    * @brief Release the page read latch
    */
-  void r_unlatch() { rw_latch_.r_unlock(); }
+  void r_unlatch() {
+    rw_latch_.r_unlock();
+    dec_pin_count();
+  }
 
   /**
    * @brief Convert the page latch from write to read mode (internal use only)
    */
-  void w_to_r_latch() { rw_latch_.w_to_r_convert_safe(); }
+  void w_to_r_latch() {
+    inc_pin_count();
+    rw_latch_.w_to_r_convert_safe();
+  }
 
   /**
    * @brief Mark the page as dirty (public interface for external components)

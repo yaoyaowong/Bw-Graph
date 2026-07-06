@@ -38,6 +38,7 @@ int main(int argc, char* argv[]) {
     }
   }
 
+  apply_memory_cli_override(argc, argv);
   bw_graph::BW_GRAPH_WCC_ALGO = algo;
   std::cout << "Threshold divisor: " << threshold_divisor << std::endl;
   print_mode(algo, benchmark);

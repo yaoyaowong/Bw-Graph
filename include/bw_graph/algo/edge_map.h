@@ -5,6 +5,7 @@
 #include "bw_graph/mem/vertex_set.h"
 
 #include <algorithm>
+#include <vector>
 #include <tbb/blocked_range.h>
 #include <tbb/concurrent_vector.h>
 #include <tbb/parallel_for.h>
@@ -102,17 +103,109 @@ vertex_subset_t bw_edge_map_sparse(bw_graph_db_t& db, vertex_subset_t& frontier,
   v_id_t vertex_count = db.get_vertex_count();
   v_id_t active_count = static_cast<v_id_t>(frontier.num_non_zeros());
   tbb::concurrent_vector<v_id_t> output;
+  const uint64_t resident_page_capacity =
+      bw_graph::BW_BUFFER_CHUNK_COUNT * bw_graph::BW_BUFFER_CHUNK_SIZE;
+  const bool use_page_grouping =
+      db.disk_manager->get_page_count() > resident_page_capacity && active_count > 64;
 
-  // Expand outgoing edges from active vertices.
-  tbb::parallel_for(tbb::blocked_range<v_id_t>(0, active_count),
-                    [&](const tbb::blocked_range<v_id_t>& range) {
-                      for (v_id_t i = range.begin(); i != range.end(); ++i) {
-                        v_id_t src = frontier.vtx(i);
-                        auto [neighbors, page] = db.read_neighbor(src);
-                        for (v_id_t dst : neighbors) {
-                          if (f.cond(dst) && f.update_atomic(src, dst)) {
-                            output.push_back(dst);
+  if (!use_page_grouping) {
+    tbb::parallel_for(tbb::blocked_range<v_id_t>(0, active_count),
+                      [&](const tbb::blocked_range<v_id_t>& range) {
+                        for (v_id_t i = range.begin(); i != range.end(); ++i) {
+                          v_id_t src = frontier.vtx(i);
+                          auto [neighbors, page] = db.read_neighbor(src);
+                          for (v_id_t dst : neighbors) {
+                            if (f.cond(dst) && f.update_atomic(src, dst)) {
+                              output.push_back(dst);
+                            }
                           }
+                          page->r_unlatch();
+                        }
+                      });
+
+    v_id_t output_size = static_cast<v_id_t>(output.size());
+    v_id_t* vertices = newA(v_id_t, output_size == 0 ? 1 : output_size);
+    tbb::parallel_for(tbb::blocked_range<v_id_t>(0, output_size),
+                      [&](const tbb::blocked_range<v_id_t>& range) {
+                        for (v_id_t i = range.begin(); i < range.end(); ++i) {
+                          vertices[i] = output[i];
+                        }
+                      });
+
+    return vertex_subset_t(vertex_count, static_cast<long>(output_size), vertices);
+  }
+
+  struct active_vertex_t {
+    page_no_t page_no;
+    uint16_t offset;
+    v_id_t src;
+    vertex_type_t vertex_type;
+  };
+
+  std::vector<active_vertex_t> active;
+  active.reserve(active_count);
+  for (v_id_t i = 0; i < active_count; ++i) {
+    v_id_t src = frontier.vtx(i);
+    db.vertex_index->v_r_lock(src);
+    protected_vertex_version_t version = db.vertex_index->protect_vertex_version(src);
+    vertex_type_t vertex_type = db.vertex_index->items[src].vertex_type;
+    active.push_back({version.page_no(), version.offset(), src, vertex_type});
+    db.vertex_index->v_r_unlock(src);
+  }
+
+  std::sort(active.begin(), active.end(), [](const active_vertex_t& lhs,
+                                             const active_vertex_t& rhs) {
+    if (lhs.page_no != rhs.page_no) {
+      return lhs.page_no < rhs.page_no;
+    }
+    return lhs.offset < rhs.offset;
+  });
+
+  std::vector<size_t> group_starts;
+  group_starts.reserve(active.size());
+  for (size_t i = 0; i < active.size();) {
+    group_starts.push_back(i);
+    page_no_t page_no = active[i].page_no;
+    do {
+      ++i;
+    } while (i < active.size() && active[i].page_no == page_no);
+  }
+
+  tbb::parallel_for(tbb::blocked_range<size_t>(0, group_starts.size()),
+                    [&](const tbb::blocked_range<size_t>& range) {
+                      for (size_t gi = range.begin(); gi != range.end(); ++gi) {
+                        size_t begin = group_starts[gi];
+                        size_t end =
+                            (gi + 1 < group_starts.size()) ? group_starts[gi + 1] : active.size();
+
+                        csr_page_t* page = db.buffer_pool->buf_page_read(active[begin].page_no,
+                                                                          db.disk_manager);
+                        for (size_t i = begin; i < end; ++i) {
+                          const active_vertex_t& item = active[i];
+                          if (item.vertex_type == GIANT) {
+                            neighbor_span_t neighbors = db.giant_db->read_neighbor(item.src);
+                            for (v_id_t dst : neighbors) {
+                              if (f.cond(dst) && f.update_atomic(item.src, dst)) {
+                                output.push_back(dst);
+                              }
+                            }
+                            continue;
+                          }
+
+#ifdef BWGRAPH_NEIGHBOR_COMPRESS
+                          for (v_id_t dst : page->get_neighbor_ptv_range(item.offset)) {
+                            if (f.cond(dst) && f.update_atomic(item.src, dst)) {
+                              output.push_back(dst);
+                            }
+                          }
+#else
+                          neighbor_span_t neighbors = page->get_neighbors(item.offset);
+                          for (v_id_t dst : neighbors) {
+                            if (f.cond(dst) && f.update_atomic(item.src, dst)) {
+                              output.push_back(dst);
+                            }
+                          }
+#endif
                         }
                         page->r_unlatch();
                       }

@@ -44,6 +44,7 @@ int main(int argc, char* argv[]) {
     }
   }
 
+  apply_memory_cli_override(argc, argv);
   bw_graph::BW_GRAPH_BFS_ALGO = algo;
   bw_graph::BW_GRAPH_BFS_START_VERTEX = start_vertex;
   std::cout << "Threshold divisor: " << threshold_divisor << std::endl;

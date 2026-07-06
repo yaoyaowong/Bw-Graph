@@ -66,13 +66,19 @@ PageType* buf_pool_t<PageType>::buf_page_read(page_no_t page_no, disk_manager_t*
   // Return directly on cache hit.
   auto it = page_map.find(page_no);
   if (it != page_map.end()) {
-    it->second->set_referenced(true);
-    it->second->r_latch();
-    return it->second;
+    PageType* page = it->second;
+    page->r_latch();
+    auto verify = page_map.find(page_no);
+    if (verify != page_map.end() && verify->second == page && page->get_page_no() == page_no) {
+      page->set_referenced(true);
+      return page;
+    }
+    page->r_unlatch();
   }
 
   // Allocate a frame on cache miss.
   PageType* free_page = nullptr;
+  bool victim_locked = false;
 
   this->lru_latch_.w_lock();
   this->free_latch_.w_lock();
@@ -85,6 +91,7 @@ PageType* buf_pool_t<PageType>::buf_page_read(page_no_t page_no, disk_manager_t*
       this->lru_latch_.w_unlock();
       throw std::runtime_error("buf_pool: all pages are pinned, cannot allocate new page");
     }
+    victim_locked = true;
     if (free_page->is_dirty()) {
       disk_manager->write_page(free_page->get_page_no(), free_page->get_data());
     }
@@ -97,7 +104,9 @@ PageType* buf_pool_t<PageType>::buf_page_read(page_no_t page_no, disk_manager_t*
   }
 
   add_to_lru_head(free_page);
-  free_page->w_latch();
+  if (!victim_locked) {
+    free_page->w_latch();
+  }
   this->free_latch_.w_unlock();
   this->lru_latch_.w_unlock();
 
@@ -122,13 +131,19 @@ PageType* buf_pool_t<PageType>::buf_page_read_for_slot_write(page_no_t page_no,
   // Return directly on cache hit.
   auto it = page_map.find(page_no);
   if (it != page_map.end()) {
-    it->second->set_referenced(true);
-    it->second->r_latch();
-    return it->second;
+    PageType* page = it->second;
+    page->r_latch();
+    auto verify = page_map.find(page_no);
+    if (verify != page_map.end() && verify->second == page && page->get_page_no() == page_no) {
+      page->set_referenced(true);
+      return page;
+    }
+    page->r_unlatch();
   }
 
   // Allocate a frame on cache miss.
   PageType* free_page = nullptr;
+  bool victim_locked = false;
 
   this->lru_latch_.w_lock();
   this->free_latch_.w_lock();
@@ -141,6 +156,7 @@ PageType* buf_pool_t<PageType>::buf_page_read_for_slot_write(page_no_t page_no,
       this->lru_latch_.w_unlock();
       throw std::runtime_error("buf_pool: all pages are pinned, cannot allocate new page");
     }
+    victim_locked = true;
     if (free_page->is_dirty()) {
       disk_manager->write_page(free_page->get_page_no(), free_page->get_data());
     }
@@ -153,7 +169,9 @@ PageType* buf_pool_t<PageType>::buf_page_read_for_slot_write(page_no_t page_no,
   }
 
   add_to_lru_head(free_page);
-  free_page->w_latch();
+  if (!victim_locked) {
+    free_page->w_latch();
+  }
   this->free_latch_.w_unlock();
   this->lru_latch_.w_unlock();
 
@@ -181,6 +199,7 @@ PageType* buf_pool_t<PageType>::buf_page_cp(page_no_t page_no, char* page_data,
   }
 
   PageType* free_page = nullptr;
+  bool victim_locked = false;
 
   this->lru_latch_.w_lock();
   this->free_latch_.w_lock();
@@ -193,6 +212,7 @@ PageType* buf_pool_t<PageType>::buf_page_cp(page_no_t page_no, char* page_data,
       this->lru_latch_.w_unlock();
       throw std::runtime_error("buf_pool: all pages are pinned, cannot allocate new page");
     }
+    victim_locked = true;
     if (free_page->is_dirty()) {
       disk_manager->write_page(free_page->get_page_no(), free_page->get_data());
     }
@@ -205,7 +225,9 @@ PageType* buf_pool_t<PageType>::buf_page_cp(page_no_t page_no, char* page_data,
   }
 
   add_to_lru_head(free_page);
-  free_page->w_latch();
+  if (!victim_locked) {
+    free_page->w_latch();
+  }
   this->free_latch_.w_unlock();
   this->lru_latch_.w_unlock();
 
@@ -304,7 +326,7 @@ PageType* buf_pool_t<PageType>::find_victim_page() {
       if (clock_hand_ == start) {
         // Fall back to a full scan.
         for (PageType* p = lru_head_; p != nullptr; p = p->get_next()) {
-          if (p->get_pin_count() == 0)
+          if (p->get_pin_count() == 0 && p->try_w_latch())
             return p;
         }
         return nullptr;
@@ -313,6 +335,19 @@ PageType* buf_pool_t<PageType>::find_victim_page() {
     }
 
     if (!clock_hand_->get_referenced()) {
+      if (!clock_hand_->try_w_latch()) {
+        clock_hand_ = clock_hand_->get_next();
+        if (clock_hand_ == nullptr)
+          clock_hand_ = lru_head_;
+        if (clock_hand_ == start) {
+          for (PageType* p = lru_head_; p != nullptr; p = p->get_next()) {
+            if (p->get_pin_count() == 0 && p->try_w_latch())
+              return p;
+          }
+          return nullptr;
+        }
+        continue;
+      }
       PageType* victim = clock_hand_;
       clock_hand_ = clock_hand_->get_next();
       if (clock_hand_ == nullptr)
@@ -329,7 +364,7 @@ PageType* buf_pool_t<PageType>::find_victim_page() {
     if (clock_hand_ == start) {
       // Fall back to a full scan.
       for (PageType* p = lru_head_; p != nullptr; p = p->get_next()) {
-        if (p->get_pin_count() == 0)
+        if (p->get_pin_count() == 0 && p->try_w_latch())
           return p;
       }
       return nullptr;
@@ -350,6 +385,7 @@ PageType* buf_pool_t<PageType>::buf_page_new(page_no_t page_no, disk_manager_t* 
   }
 
   PageType* free_page = nullptr;
+  bool victim_locked = false;
 
   this->lru_latch_.w_lock();
   this->free_latch_.w_lock();
@@ -362,6 +398,7 @@ PageType* buf_pool_t<PageType>::buf_page_new(page_no_t page_no, disk_manager_t* 
       this->lru_latch_.w_unlock();
       throw std::runtime_error("buf_pool: all pages are pinned, cannot allocate new page");
     }
+    victim_locked = true;
     if (free_page->is_dirty()) {
       disk_manager->write_page(free_page->get_page_no(), free_page->get_data());
     }
@@ -374,7 +411,9 @@ PageType* buf_pool_t<PageType>::buf_page_new(page_no_t page_no, disk_manager_t* 
   }
 
   add_to_lru_head(free_page);
-  free_page->w_latch();
+  if (!victim_locked) {
+    free_page->w_latch();
+  }
   this->free_latch_.w_unlock();
   this->lru_latch_.w_unlock();
 

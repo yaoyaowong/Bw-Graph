@@ -440,6 +440,11 @@ double bw_graph_db_t::benchmark_parallel_bfs_map(v_id_t start_vertex, long thres
   if (vertex_count == 0 || start_vertex >= vertex_count) {
     return 0.0;
   }
+  const uint64_t resident_page_capacity =
+      bw_graph::BW_BUFFER_CHUNK_COUNT * bw_graph::BW_BUFFER_CHUNK_SIZE;
+  if (this->disk_manager->get_page_count() > resident_page_capacity) {
+    threshold_divisor = std::max<long>(threshold_divisor, 40);
+  }
 
   auto parent_atomic = std::make_unique<std::atomic<v_id_t>[]>(vertex_count);
   for (v_id_t i = 0; i < vertex_count; ++i) {
@@ -481,6 +486,11 @@ std::vector<std::pair<v_id_t, uint32_t>> bw_graph_db_t::parallel_bfs_map(v_id_t 
   v_id_t vertex_count = this->get_vertex_count();
   if (vertex_count == 0 || start_vertex >= vertex_count) {
     return {};
+  }
+  const uint64_t resident_page_capacity =
+      bw_graph::BW_BUFFER_CHUNK_COUNT * bw_graph::BW_BUFFER_CHUNK_SIZE;
+  if (this->disk_manager->get_page_count() > resident_page_capacity) {
+    threshold_divisor = std::max<long>(threshold_divisor, 40);
   }
 
   auto parent_atomic = std::make_unique<std::atomic<v_id_t>[]>(vertex_count);
