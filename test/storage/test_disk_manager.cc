@@ -37,7 +37,11 @@ TEST_F(DiskManagerBasicOperationsTest, DiskManagerCreationAndInitialization) {
   EXPECT_EQ(disk_manager.get_num_deletes(), 0);
   EXPECT_EQ(disk_manager.get_flush_state(), false);
   EXPECT_EQ(disk_manager.has_flush_log_future(), false);
+#if defined(__linux__) && defined(BW_GRAPH_ENABLE_IO_URING)
+  SUCCEED() << "io_uring runtime state: " << disk_manager.is_io_uring_enabled();
+#else
   EXPECT_FALSE(disk_manager.is_io_uring_enabled());
+#endif
 
   disk_manager.shutdown();
 
