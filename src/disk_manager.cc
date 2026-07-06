@@ -4,6 +4,7 @@
 
 #include <atomic>
 #include <cerrno>
+#include <cstdio>
 #include <cstring>
 #include <filesystem>
 #include <iostream>
@@ -14,6 +15,57 @@
 namespace {
 
 constexpr unsigned int kBwGraphIoUringQueueDepth = 64;
+constexpr uint64_t kBwGraphIoUringPathLogLimit = 8;
+
+std::atomic<uint64_t> bw_graph_io_uring_read_path_logs{0};
+std::atomic<uint64_t> bw_graph_io_uring_write_path_logs{0};
+std::atomic<uint64_t> bw_graph_io_uring_fallback_logs{0};
+
+void log_limited_uring_path(std::atomic<uint64_t>& counter, const char* op, off_t offset,
+                            size_t page_size, ssize_t result) {
+  uint64_t log_index = counter.fetch_add(1, std::memory_order_relaxed);
+  if (log_index >= kBwGraphIoUringPathLogLimit) {
+    return;
+  }
+
+  char message[256];
+  ::snprintf(message, sizeof(message),
+             "DiskManager io_uring %s path used: offset=%lld size=%zu result=%zd", op,
+             static_cast<long long>(offset), page_size, result);
+  bw_graph::logger::log_info(message);
+  std::cout << message << std::endl;
+
+  if (log_index + 1 == kBwGraphIoUringPathLogLimit) {
+    char suppress_message[160];
+    ::snprintf(suppress_message, sizeof(suppress_message),
+               "DiskManager io_uring %s path log limit reached; suppressing further logs", op);
+    bw_graph::logger::log_info(suppress_message);
+    std::cout << suppress_message << std::endl;
+  }
+}
+
+void log_limited_uring_fallback(const char* op, off_t offset, size_t page_size) {
+  uint64_t log_index =
+      bw_graph_io_uring_fallback_logs.fetch_add(1, std::memory_order_relaxed);
+  if (log_index >= kBwGraphIoUringPathLogLimit) {
+    return;
+  }
+
+  char message[256];
+  ::snprintf(message, sizeof(message),
+             "DiskManager io_uring %s submit unavailable; falling back to pread/pwrite: "
+             "offset=%lld size=%zu",
+             op, static_cast<long long>(offset), page_size);
+  bw_graph::logger::log_info(message);
+  std::cout << message << std::endl;
+
+  if (log_index + 1 == kBwGraphIoUringPathLogLimit) {
+    bw_graph::logger::log_info(
+        "DiskManager io_uring fallback log limit reached; suppressing further logs");
+    std::cout << "DiskManager io_uring fallback log limit reached; suppressing further logs"
+              << std::endl;
+  }
+}
 
 struct thread_io_uring_t {
   io_uring ring{};
@@ -346,9 +398,16 @@ void disk_manager_t::write_page(page_no_t page_no, const char* page_data) {
   // SSD-optimized write using cached file descriptor.
   ssize_t bytes_written = -1;
 #if defined(__linux__) && defined(BW_GRAPH_ENABLE_IO_URING)
-  if (!io_uring_supported_ ||
-      !submit_uring_write(db_fd_, page_data, page_size_, static_cast<off_t>(offset),
-                          &bytes_written)) {
+  if (io_uring_supported_) {
+    if (submit_uring_write(db_fd_, page_data, page_size_, static_cast<off_t>(offset),
+                           &bytes_written)) {
+      log_limited_uring_path(bw_graph_io_uring_write_path_logs, "write",
+                             static_cast<off_t>(offset), page_size_, bytes_written);
+    } else {
+      log_limited_uring_fallback("write", static_cast<off_t>(offset), page_size_);
+      bytes_written = ::pwrite(db_fd_, page_data, page_size_, offset);
+    }
+  } else {
     bytes_written = ::pwrite(db_fd_, page_data, page_size_, offset);
   }
 #else
@@ -419,9 +478,16 @@ void disk_manager_t::read_page(page_no_t page_no, char* page_data) {
   // SSD-optimized read using cached file descriptor.
   ssize_t bytes_read = -1;
 #if defined(__linux__) && defined(BW_GRAPH_ENABLE_IO_URING)
-  if (!io_uring_supported_ ||
-      !submit_uring_read(db_fd_, page_data, page_size_, static_cast<off_t>(offset),
-                         &bytes_read)) {
+  if (io_uring_supported_) {
+    if (submit_uring_read(db_fd_, page_data, page_size_, static_cast<off_t>(offset),
+                          &bytes_read)) {
+      log_limited_uring_path(bw_graph_io_uring_read_path_logs, "read",
+                             static_cast<off_t>(offset), page_size_, bytes_read);
+    } else {
+      log_limited_uring_fallback("read", static_cast<off_t>(offset), page_size_);
+      bytes_read = ::pread(db_fd_, page_data, page_size_, offset);
+    }
+  } else {
     bytes_read = ::pread(db_fd_, page_data, page_size_, offset);
   }
 #else
