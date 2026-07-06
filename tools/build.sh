@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # build.sh - Build script for BwGraph project
-# Usage: ./build.sh [-t|--type debug|release] [-c|--clean] [-j|--jobs N] [--compress] [--txn] [-h|--help]
+# Usage: ./build.sh [-t|--type debug|release] [-c|--clean] [-j|--jobs N] [--compress] [--txn] [--uring] [-h|--help]
 
 set -e  # Exit on any error
 
@@ -11,6 +11,7 @@ CLEAN_BUILD=false
 RUN_TESTS=true
 NEIGHBOR_COMPRESS=false
 ENABLE_TXN=false
+ENABLE_IO_URING=false
 
 # Detect system type and set appropriate CPU core count
 if [[ "$OSTYPE" == "darwin"* ]]; then
@@ -35,6 +36,7 @@ show_usage() {
     echo "  -j, --jobs N        Number of parallel jobs (default: auto-detected)"
     echo "  --compress          Build with PTV-compressed CSR neighbors (default: off)"
     echo "  --txn               Enable transaction support (default: off)"
+    echo "  --uring             Enable Linux io_uring page I/O backend (Linux only, default: off)"
     echo "  --no-tests          Skip running tests"
     echo "  -h, --help          Show this help message"
     echo ""
@@ -90,6 +92,10 @@ while [[ $# -gt 0 ]]; do
             ENABLE_TXN=true
             shift
             ;;
+        --uring)
+            ENABLE_IO_URING=true
+            shift
+            ;;
         -h|--help)
             show_usage
             exit 0
@@ -109,7 +115,13 @@ echo "Clean build: $CLEAN_BUILD"
 echo "Run tests: $RUN_TESTS"
 echo "Neighbor compression: $NEIGHBOR_COMPRESS"
 echo "Transaction support: $ENABLE_TXN"
+echo "io_uring support: $ENABLE_IO_URING"
 echo ""
+
+if [[ "$OSTYPE" == "darwin"* && "$ENABLE_IO_URING" = true ]]; then
+    echo "Warning: --uring is Linux-only; macOS will use the current pread/pwrite path."
+    ENABLE_IO_URING=false
+fi
 
 if [ "$NEIGHBOR_COMPRESS" = true ]; then
     CMAKE_NEIGHBOR_COMPRESS="ON"
@@ -121,6 +133,12 @@ if [ "$ENABLE_TXN" = true ]; then
     CMAKE_ENABLE_TXN="ON"
 else
     CMAKE_ENABLE_TXN="OFF"
+fi
+
+if [ "$ENABLE_IO_URING" = true ]; then
+    CMAKE_ENABLE_IO_URING="ON"
+else
+    CMAKE_ENABLE_IO_URING="OFF"
 fi
 
 # Clean build directory if requested
@@ -139,15 +157,16 @@ if [ -d "build" ]; then
         CURRENT_BUILD_TYPE=$(grep "CMAKE_BUILD_TYPE:STRING=" CMakeCache.txt | cut -d'=' -f2 2>/dev/null || echo "")
         CURRENT_NEIGHBOR_COMPRESS=$(grep "BWGRAPH_NEIGHBOR_COMPRESS:BOOL=" CMakeCache.txt | cut -d'=' -f2 2>/dev/null || echo "")
         CURRENT_ENABLE_TXN=$(grep "BW_GRAPH_ENABLE_TRANSACTION:BOOL=" CMakeCache.txt | cut -d'=' -f2 2>/dev/null || echo "")
-        if [ "$CURRENT_BUILD_TYPE" != "$BUILD_TYPE" ] || [ "$CURRENT_NEIGHBOR_COMPRESS" != "$CMAKE_NEIGHBOR_COMPRESS" ] || [ "$CURRENT_ENABLE_TXN" != "$CMAKE_ENABLE_TXN" ]; then
+        CURRENT_ENABLE_IO_URING=$(grep "BW_GRAPH_ENABLE_IO_URING:BOOL=" CMakeCache.txt | cut -d'=' -f2 2>/dev/null || echo "")
+        if [ "$CURRENT_BUILD_TYPE" != "$BUILD_TYPE" ] || [ "$CURRENT_NEIGHBOR_COMPRESS" != "$CMAKE_NEIGHBOR_COMPRESS" ] || [ "$CURRENT_ENABLE_TXN" != "$CMAKE_ENABLE_TXN" ] || [ "$CURRENT_ENABLE_IO_URING" != "$CMAKE_ENABLE_IO_URING" ]; then
             echo "Build configuration changed, reconfiguring..."
-            cmake -DCMAKE_BUILD_TYPE=$BUILD_TYPE -DBWGRAPH_NEIGHBOR_COMPRESS=$CMAKE_NEIGHBOR_COMPRESS -DBW_GRAPH_ENABLE_TRANSACTION=$CMAKE_ENABLE_TXN ..
+            cmake -DCMAKE_BUILD_TYPE=$BUILD_TYPE -DBWGRAPH_NEIGHBOR_COMPRESS=$CMAKE_NEIGHBOR_COMPRESS -DBW_GRAPH_ENABLE_TRANSACTION=$CMAKE_ENABLE_TXN -DBW_GRAPH_ENABLE_IO_URING=$CMAKE_ENABLE_IO_URING ..
         else
             echo "Build type unchanged, skipping cmake configuration..."
         fi
     else
         echo "No CMakeCache.txt found, running cmake configuration..."
-        cmake -DCMAKE_BUILD_TYPE=$BUILD_TYPE -DBWGRAPH_NEIGHBOR_COMPRESS=$CMAKE_NEIGHBOR_COMPRESS -DBW_GRAPH_ENABLE_TRANSACTION=$CMAKE_ENABLE_TXN ..
+        cmake -DCMAKE_BUILD_TYPE=$BUILD_TYPE -DBWGRAPH_NEIGHBOR_COMPRESS=$CMAKE_NEIGHBOR_COMPRESS -DBW_GRAPH_ENABLE_TRANSACTION=$CMAKE_ENABLE_TXN -DBW_GRAPH_ENABLE_IO_URING=$CMAKE_ENABLE_IO_URING ..
     fi
 else
     echo "Creating new build directory..."
@@ -156,7 +175,7 @@ else
     
     # Run cmake configuration for new build directory
     echo "Configuring project with CMake..."
-    cmake -DCMAKE_BUILD_TYPE=$BUILD_TYPE -DBWGRAPH_NEIGHBOR_COMPRESS=$CMAKE_NEIGHBOR_COMPRESS -DBW_GRAPH_ENABLE_TRANSACTION=$CMAKE_ENABLE_TXN ..
+    cmake -DCMAKE_BUILD_TYPE=$BUILD_TYPE -DBWGRAPH_NEIGHBOR_COMPRESS=$CMAKE_NEIGHBOR_COMPRESS -DBW_GRAPH_ENABLE_TRANSACTION=$CMAKE_ENABLE_TXN -DBW_GRAPH_ENABLE_IO_URING=$CMAKE_ENABLE_IO_URING ..
 fi
 
 # Build the project
@@ -179,6 +198,7 @@ echo "=== Build completed successfully! ==="
 echo "Build type: $BUILD_TYPE"
 echo "Neighbor compression: $NEIGHBOR_COMPRESS"
 echo "Transaction support: $ENABLE_TXN"
+echo "io_uring support: $ENABLE_IO_URING"
 echo "Executables are in: $(pwd)/bin/"
 echo ""
 

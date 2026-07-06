@@ -72,6 +72,10 @@ inline bool apply_memory_cli_override(int argc, char** argv) {
       apply_buffer_pool_memory_budget_mb(
           static_cast<uint64_t>(std::strtoull(value.c_str(), nullptr, 10)));
       applied = true;
+    } else if (read_cli_value(argc, argv, i, "--prefetch-workers", value)) {
+      bw_graph::BW_BUFFER_PREFETCH_WORKER_COUNT =
+          static_cast<uint64_t>(std::strtoull(value.c_str(), nullptr, 10));
+      applied = true;
     }
   }
   return applied;

@@ -26,6 +26,8 @@ inline size_t BW_GRAPH_DEFAULT_DB_IO_SIZE = 16;
 inline size_t BW_DELTA_PAGE_SIZE = 4096;
 inline uint64_t BW_BUFFER_CHUNK_COUNT = 16;
 inline uint64_t BW_BUFFER_CHUNK_SIZE = 1024 * 4;
+// Worker count for asynchronous CSR buffer prefetch (0 = disabled).
+inline uint64_t BW_BUFFER_PREFETCH_WORKER_COUNT = 0;
 inline uint64_t BW_DELTA_BUFFER_CHUNK_COUNT = 16;
 inline uint64_t BW_DELTA_BUFFER_CHUNK_SIZE = 1024;
 // Background delta-page flush interval in milliseconds (0 = disabled)
@@ -271,6 +273,8 @@ inline void load_yaml_config(const std::string& path = "config/default.yaml") {
         parse_int_like(bf["csr_flush_interval_ms"], bw_graph::BW_CSR_FLUSH_INTERVAL_MS));
     bw_graph::BW_CSR_FLUSH_WORKER_COUNT = static_cast<uint64_t>(
         parse_int_like(bf["csr_flush_workers"], bw_graph::BW_CSR_FLUSH_WORKER_COUNT));
+    bw_graph::BW_BUFFER_PREFETCH_WORKER_COUNT = static_cast<uint64_t>(
+        parse_int_like(bf["prefetch_workers"], bw_graph::BW_BUFFER_PREFETCH_WORKER_COUNT));
   }
 
   // delta_buffer
@@ -453,6 +457,9 @@ inline void print_config() {
             << std::endl;
   std::cout << std::setw(name_width)
             << "  BW_DELTA_BUFFER_CHUNK_SIZE:" << bw_graph::BW_DELTA_BUFFER_CHUNK_SIZE << std::endl;
+  std::cout << std::setw(name_width)
+            << "  BW_BUFFER_PREFETCH_WORKER_COUNT:"
+            << bw_graph::BW_BUFFER_PREFETCH_WORKER_COUNT << std::endl;
 
   // Graph
   std::cout << "\n[Graph Algorithm Configuration]" << std::endl;
@@ -627,6 +634,8 @@ inline void apply_cli_overrides(int argc, char** argv) {
       bw_graph::BW_DELTA_FLUSH_WORKER_COUNT = static_cast<uint64_t>(std::stoll(val));
     else if (key == "csr-flush-workers")
       bw_graph::BW_CSR_FLUSH_WORKER_COUNT = static_cast<uint64_t>(std::stoll(val));
+    else if (key == "prefetch-workers")
+      bw_graph::BW_BUFFER_PREFETCH_WORKER_COUNT = static_cast<uint64_t>(std::stoll(val));
     else if (key == "mem")
       apply_buffer_pool_memory_budget_mb(static_cast<uint64_t>(std::stoull(val)));
     else

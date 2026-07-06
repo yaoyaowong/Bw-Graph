@@ -7,10 +7,16 @@
 #include "bw_graph/storage/disk_manager.h"
 #include "bw_graph/storage/page.h"
 
+#include <atomic>
+#include <condition_variable>
 #include <cstddef>
+#include <deque>
 #include <folly/concurrency/ConcurrentHashMap.h>
 #include <functional>
+#include <mutex>
+#include <thread>
 #include <type_traits>
+#include <unordered_set>
 #include <vector>
 
 /**
@@ -82,7 +88,24 @@ template <typename PageType>
 struct buf_pool_t {
   static_assert(std::is_base_of_v<page_t, PageType>, "PageType must derive from page_t");
 
+  struct stats_t {
+    uint64_t cache_hits{0};
+    uint64_t cache_misses{0};
+    uint64_t duplicate_miss_waits{0};
+    uint64_t evictions{0};
+    uint64_t dirty_writebacks{0};
+    uint64_t prefetches{0};
+    uint64_t prefetch_enqueued{0};
+    uint64_t prefetch_completed{0};
+    uint64_t prefetch_dropped{0};
+  };
+
 private:
+  struct prefetch_job_t {
+    page_no_t page_no;
+    disk_manager_t* disk_manager;
+  };
+
   /* The number of chunks in the pool. */
   size_t chunk_num;
 
@@ -116,6 +139,36 @@ private:
   /* Page frame size in bytes (determines I/O and memcpy size) */
   size_t page_size_{bw_graph::BW_GRAPH_PAGE_SIZE};
 
+  /* Total number of resident frames in this pool. */
+  size_t resident_page_count_{0};
+
+  /* Cold-miss coordination: at most one thread loads a page at a time. */
+  std::mutex loading_mutex_;
+  std::condition_variable loading_cv_;
+  std::unordered_set<page_no_t> loading_pages_;
+
+  /* Background prefetch workers keep storage I/O off compute workers. */
+  std::mutex prefetch_mutex_;
+  std::condition_variable prefetch_cv_;
+  std::condition_variable prefetch_idle_cv_;
+  std::deque<prefetch_job_t> prefetch_queue_;
+  std::unordered_set<page_no_t> queued_prefetch_pages_;
+  std::vector<std::thread> prefetch_workers_;
+  bool prefetch_stop_{false};
+  size_t prefetch_active_count_{0};
+  size_t prefetch_queue_capacity_{0};
+
+  /* Lightweight performance counters. */
+  std::atomic<uint64_t> cache_hits_{0};
+  std::atomic<uint64_t> cache_misses_{0};
+  std::atomic<uint64_t> duplicate_miss_waits_{0};
+  std::atomic<uint64_t> evictions_{0};
+  std::atomic<uint64_t> dirty_writebacks_{0};
+  std::atomic<uint64_t> prefetches_{0};
+  std::atomic<uint64_t> prefetch_enqueued_{0};
+  std::atomic<uint64_t> prefetch_completed_{0};
+  std::atomic<uint64_t> prefetch_dropped_{0};
+
 public:
   /**
    * @brief Default constructor
@@ -123,6 +176,7 @@ public:
   buf_pool_t() : chunk_num(0) {}
 
   ~buf_pool_t() {
+    stop_prefetch_workers();
     for (buf_chunk_t<PageType>* chunk : chunks) {
       delete chunk;
     }
@@ -167,6 +221,19 @@ public:
   PageType* buf_page_read_for_slot_write(page_no_t page_no, disk_manager_t* disk_manager);
 
   /**
+   * @brief Best-effort prefetch. Loads the page and immediately releases it.
+   *
+   * @param page_no       Page number to warm in the pool
+   * @param disk_manager  Disk manager used for page I/O
+   */
+  void buf_page_prefetch(page_no_t page_no, disk_manager_t* disk_manager);
+
+  /**
+   * @brief Wait until all queued asynchronous prefetches have finished.
+   */
+  void wait_for_prefetch_idle();
+
+  /**
    * @brief Copy external page data into the buffer pool
    *
    * @param page_no       Page number to copy into
@@ -192,6 +259,16 @@ public:
    * @return true if the page is absent or removed, false if it is still in use
    */
   bool retire_page(page_no_t page_no);
+
+  /**
+   * @brief Return a stable snapshot of buffer pool counters.
+   */
+  stats_t get_stats() const;
+
+  /**
+   * @brief Reset buffer pool counters to zero.
+   */
+  void reset_stats();
 
   /**
    * @brief Traverse the free list with a lambda function
@@ -259,6 +336,58 @@ private:
    * @return Pointer to the selected victim page
    */
   PageType* find_victim_page();
+
+  /**
+   * @brief Try to find and latch a cached page. Returns nullptr on miss/race.
+   */
+  PageType* try_latch_cached_page(page_no_t page_no, bool write_latch);
+
+  /**
+   * @brief Register this thread as the loader for @p page_no, or wait.
+   *
+   * @return true if caller should load the page, false if it should retry lookup.
+   */
+  bool register_page_load(page_no_t page_no);
+
+  /**
+   * @brief Mark a cold load as complete and wake waiters.
+   */
+  void finish_page_load(page_no_t page_no);
+
+  /**
+   * @brief Claim a free/victim frame with its write latch held.
+   */
+  PageType* claim_frame_for_reuse(disk_manager_t* disk_manager);
+
+  /**
+   * @brief Shared implementation for read and read-for-write.
+   */
+  PageType* read_page_internal(page_no_t page_no, disk_manager_t* disk_manager, bool write_latch);
+
+  /**
+   * @brief Start the background prefetch workers on first use.
+   */
+  void ensure_prefetch_workers();
+
+  /**
+   * @brief Stop and join all background prefetch workers.
+   */
+  void stop_prefetch_workers();
+
+  /**
+   * @brief Worker body for asynchronous prefetch.
+   */
+  void prefetch_worker_loop();
+
+  /**
+   * @brief Synchronous prefetch implementation used by workers and fallback mode.
+   */
+  void prefetch_page_sync(page_no_t page_no, disk_manager_t* disk_manager);
+
+  /**
+   * @brief Return whether a page is cached or currently being loaded.
+   */
+  bool is_page_cached_or_loading(page_no_t page_no);
 };
 
 #include "bw_graph/io/io_csr.h"

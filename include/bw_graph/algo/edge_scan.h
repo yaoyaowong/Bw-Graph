@@ -5,11 +5,10 @@
 #include "bw_graph/db/db.h"
 
 #include <algorithm>
-#include <vector>
-
 #include <tbb/blocked_range.h>
 #include <tbb/parallel_reduce.h>
 #include <tbb/task_arena.h>
+#include <vector>
 
 inline bool bw_should_use_page_local_edge_scan(uint64_t page_count,
                                                uint64_t resident_page_capacity) {
@@ -209,8 +208,27 @@ T bw_page_local_edge_scan(bw_graph_db_t& db, std::function<T(v_id_t src, v_id_t 
     return tbb::parallel_reduce(
         tbb::blocked_range<size_t>(0, active_pages_scan->size()), zero,
         [&](const tbb::blocked_range<size_t>& range, T local_result) -> T {
+          const uint64_t resident_page_capacity =
+              bw_graph::BW_BUFFER_CHUNK_COUNT * bw_graph::BW_BUFFER_CHUNK_SIZE;
+          const size_t prefetch_distance =
+              std::min<size_t>(8, std::max<size_t>(1, resident_page_capacity / 16));
+          const bool should_prefetch =
+              bw_graph::BW_BUFFER_PREFETCH_WORKER_COUNT > 0 &&
+              active_pages_scan->size() * 4 < static_cast<size_t>(page_count) * 3;
+          auto submit_prefetch = [&](size_t page_idx) {
+            if (!should_prefetch) {
+              return;
+            }
+            if (page_idx >= active_pages_scan->size()) {
+              return;
+            }
+            const page_no_t prefetch_page_no = (*active_pages_scan)[page_idx];
+            db.buffer_pool->buf_page_prefetch(prefetch_page_no, db.disk_manager);
+          };
+
           for (size_t active_page_idx = range.begin(); active_page_idx != range.end();
                ++active_page_idx) {
+            submit_prefetch(active_page_idx + prefetch_distance);
             const page_no_t page_no = (*active_pages_scan)[active_page_idx];
             const size_t begin = (*page_offsets_scan)[page_no];
             const size_t end = (*page_offsets_scan)[page_no + 1];

@@ -3,8 +3,101 @@
 #include "bw_graph/common/logger.h"
 
 #include <atomic>
+#include <cerrno>
+#include <cstring>
 #include <filesystem>
 #include <iostream>
+
+#if defined(__linux__) && defined(BW_GRAPH_ENABLE_IO_URING)
+#include <liburing.h>
+
+namespace {
+
+constexpr unsigned int kBwGraphIoUringQueueDepth = 64;
+
+struct thread_io_uring_t {
+  io_uring ring{};
+  bool ready{false};
+
+  thread_io_uring_t() {
+    ready = (::io_uring_queue_init(kBwGraphIoUringQueueDepth, &ring, 0) == 0);
+  }
+
+  ~thread_io_uring_t() {
+    if (ready) {
+      ::io_uring_queue_exit(&ring);
+    }
+  }
+};
+
+thread_local thread_io_uring_t bw_graph_thread_io_uring;
+
+bool submit_uring_read(int fd, void* page_data, size_t page_size, off_t offset,
+                       ssize_t* bytes_read) {
+  if (!bw_graph_thread_io_uring.ready) {
+    return false;
+  }
+
+  io_uring_sqe* sqe = ::io_uring_get_sqe(&bw_graph_thread_io_uring.ring);
+  if (sqe == nullptr) {
+    return false;
+  }
+  ::io_uring_prep_read(sqe, fd, page_data, static_cast<unsigned int>(page_size), offset);
+
+  if (::io_uring_submit(&bw_graph_thread_io_uring.ring) < 0) {
+    return false;
+  }
+
+  io_uring_cqe* cqe = nullptr;
+  int wait_result = ::io_uring_wait_cqe(&bw_graph_thread_io_uring.ring, &cqe);
+  if (wait_result < 0 || cqe == nullptr) {
+    return false;
+  }
+
+  if (cqe->res < 0) {
+    errno = -cqe->res;
+    *bytes_read = -1;
+  } else {
+    *bytes_read = cqe->res;
+  }
+  ::io_uring_cqe_seen(&bw_graph_thread_io_uring.ring, cqe);
+  return true;
+}
+
+bool submit_uring_write(int fd, const void* page_data, size_t page_size, off_t offset,
+                        ssize_t* bytes_written) {
+  if (!bw_graph_thread_io_uring.ready) {
+    return false;
+  }
+
+  io_uring_sqe* sqe = ::io_uring_get_sqe(&bw_graph_thread_io_uring.ring);
+  if (sqe == nullptr) {
+    return false;
+  }
+  ::io_uring_prep_write(sqe, fd, page_data, static_cast<unsigned int>(page_size), offset);
+
+  if (::io_uring_submit(&bw_graph_thread_io_uring.ring) < 0) {
+    return false;
+  }
+
+  io_uring_cqe* cqe = nullptr;
+  int wait_result = ::io_uring_wait_cqe(&bw_graph_thread_io_uring.ring, &cqe);
+  if (wait_result < 0 || cqe == nullptr) {
+    return false;
+  }
+
+  if (cqe->res < 0) {
+    errno = -cqe->res;
+    *bytes_written = -1;
+  } else {
+    *bytes_written = cqe->res;
+  }
+  ::io_uring_cqe_seen(&bw_graph_thread_io_uring.ring, cqe);
+  return true;
+}
+
+} // namespace
+#endif
 
 // Construct disk_manager_t.
 disk_manager_t::disk_manager_t(const std::filesystem::path& db_file, size_t page_size)
@@ -83,6 +176,19 @@ disk_manager_t::disk_manager_t(const std::filesystem::path& db_file, size_t page
                   POSIX_FADV_RANDOM); // Database file: random access
   ::posix_fadvise(log_fd_, 0, 0,
                   POSIX_FADV_SEQUENTIAL); // Log file: sequential access
+#endif
+
+#if defined(__linux__) && defined(BW_GRAPH_ENABLE_IO_URING)
+  io_uring probe_ring{};
+  int uring_init_result = ::io_uring_queue_init(kBwGraphIoUringQueueDepth, &probe_ring, 0);
+  if (uring_init_result == 0) {
+    io_uring_supported_ = true;
+    ::io_uring_queue_exit(&probe_ring);
+    bw_graph::logger::log_info("DiskManager io_uring backend enabled");
+  } else {
+    io_uring_supported_ = false;
+    bw_graph::logger::log_error("DiskManager io_uring init failed; falling back to pread/pwrite");
+  }
 #endif
 
   // Compute initial valid page count via backward scan.
@@ -237,8 +343,17 @@ void disk_manager_t::write_page(page_no_t page_no, const char* page_data) {
     }
   }
 
-  // SSD-optimized write using cached file descriptor
-  ssize_t bytes_written = ::pwrite(db_fd_, page_data, page_size_, offset);
+  // SSD-optimized write using cached file descriptor.
+  ssize_t bytes_written = -1;
+#if defined(__linux__) && defined(BW_GRAPH_ENABLE_IO_URING)
+  if (!io_uring_supported_ ||
+      !submit_uring_write(db_fd_, page_data, page_size_, static_cast<off_t>(offset),
+                          &bytes_written)) {
+    bytes_written = ::pwrite(db_fd_, page_data, page_size_, offset);
+  }
+#else
+  bytes_written = ::pwrite(db_fd_, page_data, page_size_, offset);
+#endif
 
   if (bytes_written != static_cast<ssize_t>(page_size_)) {
     bw_graph::logger::log_error("I/O error while writing page");
@@ -301,8 +416,17 @@ void disk_manager_t::read_page(page_no_t page_no, char* page_data) {
     return;
   }
 
-  // SSD-optimized read using cached file descriptor
-  ssize_t bytes_read = ::pread(db_fd_, page_data, page_size_, offset);
+  // SSD-optimized read using cached file descriptor.
+  ssize_t bytes_read = -1;
+#if defined(__linux__) && defined(BW_GRAPH_ENABLE_IO_URING)
+  if (!io_uring_supported_ ||
+      !submit_uring_read(db_fd_, page_data, page_size_, static_cast<off_t>(offset),
+                         &bytes_read)) {
+    bytes_read = ::pread(db_fd_, page_data, page_size_, offset);
+  }
+#else
+  bytes_read = ::pread(db_fd_, page_data, page_size_, offset);
+#endif
 
   if (bytes_read != static_cast<ssize_t>(page_size_)) {
     if (bytes_read == -1) {
@@ -321,6 +445,8 @@ void disk_manager_t::read_page(page_no_t page_no, char* page_data) {
   }
   // If bytes_read == page_size_, read was successful, no action needed
 }
+
+bool disk_manager_t::is_io_uring_enabled() const { return io_uring_supported_; }
 
 // Write log.
 void disk_manager_t::write_log(char* log_data, int size) {

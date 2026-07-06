@@ -37,6 +37,7 @@ TEST_F(DiskManagerBasicOperationsTest, DiskManagerCreationAndInitialization) {
   EXPECT_EQ(disk_manager.get_num_deletes(), 0);
   EXPECT_EQ(disk_manager.get_flush_state(), false);
   EXPECT_EQ(disk_manager.has_flush_log_future(), false);
+  EXPECT_FALSE(disk_manager.is_io_uring_enabled());
 
   disk_manager.shutdown();
 

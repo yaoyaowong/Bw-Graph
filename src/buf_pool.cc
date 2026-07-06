@@ -5,6 +5,7 @@
 #include "bw_graph/io/io_delta.h"
 #include "bw_graph/storage/disk_manager.h"
 
+#include <algorithm>
 #include <cstddef>
 #include <cstring>
 #include <limits>
@@ -42,12 +43,12 @@ buf_pool_t<PageType>* buf_pool_t<PageType>::buf_pool_init(size_t chunk_count,
   pool->chunk_num = chunk_count;
   pool->page_size_ = page_size;
 
-  if (chunk_count != 0 &&
-      page_count_per_chunk > std::numeric_limits<size_t>::max() / chunk_count) {
+  if (chunk_count != 0 && page_count_per_chunk > std::numeric_limits<size_t>::max() / chunk_count) {
     delete pool;
     throw std::overflow_error("buf_pool: resident page count overflow");
   }
   const size_t resident_page_count = chunk_count * page_count_per_chunk;
+  pool->resident_page_count_ = resident_page_count;
   const size_t page_map_capacity = std::max<size_t>(8, resident_page_count);
   pool->page_map = folly::ConcurrentHashMap<page_no_t, PageType*>(page_map_capacity);
 
@@ -59,30 +60,65 @@ buf_pool_t<PageType>* buf_pool_t<PageType>::buf_pool_init(size_t chunk_count,
   return pool;
 }
 
-// Read a page and return it with a read latch.
+// Try to latch a cached page and verify the frame was not evicted/reused.
 template <typename PageType>
-// Handle buf page read.
-PageType* buf_pool_t<PageType>::buf_page_read(page_no_t page_no, disk_manager_t* disk_manager) {
-  // Return directly on cache hit.
+PageType* buf_pool_t<PageType>::try_latch_cached_page(page_no_t page_no, bool write_latch) {
   auto it = page_map.find(page_no);
   if (it != page_map.end()) {
     PageType* page = it->second;
-    page->r_latch();
+    if (write_latch) {
+      page->w_latch();
+    } else {
+      page->r_latch();
+    }
     auto verify = page_map.find(page_no);
     if (verify != page_map.end() && verify->second == page && page->get_page_no() == page_no) {
       page->set_referenced(true);
       return page;
     }
-    page->r_unlatch();
+    if (write_latch) {
+      page->w_unlatch();
+    } else {
+      page->r_unlatch();
+    }
+  }
+  return nullptr;
+}
+
+// Register this thread as the cold-page loader, or wait for the active loader.
+template <typename PageType>
+bool buf_pool_t<PageType>::register_page_load(page_no_t page_no) {
+  std::unique_lock<std::mutex> lk(loading_mutex_);
+  auto inserted = loading_pages_.insert(page_no);
+  if (inserted.second) {
+    return true;
   }
 
-  // Allocate a frame on cache miss.
+  duplicate_miss_waits_.fetch_add(1, std::memory_order_relaxed);
+  loading_cv_.wait(lk, [&] { return loading_pages_.find(page_no) == loading_pages_.end(); });
+  return false;
+}
+
+// Finish a cold-page load and wake waiters.
+template <typename PageType>
+void buf_pool_t<PageType>::finish_page_load(page_no_t page_no) {
+  {
+    std::lock_guard<std::mutex> lk(loading_mutex_);
+    loading_pages_.erase(page_no);
+  }
+  loading_cv_.notify_all();
+}
+
+// Claim a free frame or evict a victim. Dirty write-back runs outside LRU/free locks.
+template <typename PageType>
+PageType* buf_pool_t<PageType>::claim_frame_for_reuse(disk_manager_t* disk_manager) {
   PageType* free_page = nullptr;
   bool victim_locked = false;
+  bool write_dirty_victim = false;
+  page_no_t victim_page_no = bw_graph::BW_GRAPH_DEFAULT_PAGE_NO;
 
   this->lru_latch_.w_lock();
   this->free_latch_.w_lock();
-
   if (free_head_ == nullptr) {
     // Evict one page when no free frame exists.
     free_page = find_victim_page();
@@ -92,11 +128,14 @@ PageType* buf_pool_t<PageType>::buf_page_read(page_no_t page_no, disk_manager_t*
       throw std::runtime_error("buf_pool: all pages are pinned, cannot allocate new page");
     }
     victim_locked = true;
+    victim_page_no = free_page->get_page_no();
     if (free_page->is_dirty()) {
-      disk_manager->write_page(free_page->get_page_no(), free_page->get_data());
+      write_dirty_victim = true;
+      dirty_writebacks_.fetch_add(1, std::memory_order_relaxed);
     }
+    evictions_.fetch_add(1, std::memory_order_relaxed);
     remove_from_lru_list(free_page);
-    page_map.erase(free_page->get_page_no());
+    page_map.erase(victim_page_no);
     free_page->disable_parse();
   } else {
     free_page = free_head_;
@@ -110,17 +149,75 @@ PageType* buf_pool_t<PageType>::buf_page_read(page_no_t page_no, disk_manager_t*
   this->free_latch_.w_unlock();
   this->lru_latch_.w_unlock();
 
-  // Load page data into the selected frame.
-  disk_manager->read_page(page_no, free_page->get_data());
-  free_page->set_page_no(page_no);
-  free_page->disable_parse();
-  free_page->self_parse();
-  free_page->set_page_state(PAGE_IN_LRU);
-  free_page->set_referenced(true);
+  if (write_dirty_victim) {
+    disk_manager->write_page(victim_page_no, free_page->get_data());
+    free_page->mark_clean();
+  }
 
-  page_map.insert(page_no, free_page);
+  return free_page;
+}
+
+// Shared page read implementation.
+template <typename PageType>
+PageType* buf_pool_t<PageType>::read_page_internal(page_no_t page_no, disk_manager_t* disk_manager,
+                                                   bool write_latch) {
+  while (true) {
+    PageType* cached_page = try_latch_cached_page(page_no, write_latch);
+    if (cached_page != nullptr) {
+      cache_hits_.fetch_add(1, std::memory_order_relaxed);
+      return cached_page;
+    }
+
+    if (register_page_load(page_no)) {
+      break;
+    }
+  }
+
+  cache_misses_.fetch_add(1, std::memory_order_relaxed);
+
+  PageType* free_page = nullptr;
+  try {
+    // A page may have been installed by a non-read path while this thread was
+    // becoming the loader.
+    PageType* cached_page = try_latch_cached_page(page_no, write_latch);
+    if (cached_page != nullptr) {
+      cache_hits_.fetch_add(1, std::memory_order_relaxed);
+      finish_page_load(page_no);
+      return cached_page;
+    }
+
+    free_page = claim_frame_for_reuse(disk_manager);
+
+    // Load page data into the selected frame.
+    disk_manager->read_page(page_no, free_page->get_data());
+    free_page->set_page_no(page_no);
+    free_page->disable_parse();
+    free_page->self_parse();
+    free_page->set_page_state(PAGE_IN_LRU);
+    free_page->set_referenced(true);
+
+    page_map.insert(page_no, free_page);
+    finish_page_load(page_no);
+  } catch (...) {
+    finish_page_load(page_no);
+    if (free_page != nullptr) {
+      free_page->w_unlatch();
+    }
+    throw;
+  }
+
+  if (write_latch) {
+    return free_page;
+  }
   free_page->w_to_r_latch();
   return free_page;
+}
+
+// Read a page and return it with a read latch.
+template <typename PageType>
+// Handle buf page read.
+PageType* buf_pool_t<PageType>::buf_page_read(page_no_t page_no, disk_manager_t* disk_manager) {
+  return read_page_internal(page_no, disk_manager, false);
 }
 
 // Read a page and return it for write access.
@@ -128,63 +225,176 @@ template <typename PageType>
 // Handle buf page read for slot write.
 PageType* buf_pool_t<PageType>::buf_page_read_for_slot_write(page_no_t page_no,
                                                              disk_manager_t* disk_manager) {
-  // Return directly on cache hit.
-  auto it = page_map.find(page_no);
-  if (it != page_map.end()) {
-    PageType* page = it->second;
-    page->r_latch();
-    auto verify = page_map.find(page_no);
-    if (verify != page_map.end() && verify->second == page && page->get_page_no() == page_no) {
-      page->set_referenced(true);
-      return page;
+  return read_page_internal(page_no, disk_manager, true);
+}
+
+template <typename PageType>
+bool buf_pool_t<PageType>::is_page_cached_or_loading(page_no_t page_no) {
+  if (page_map.find(page_no) != page_map.end()) {
+    return true;
+  }
+  std::lock_guard<std::mutex> lk(loading_mutex_);
+  return loading_pages_.find(page_no) != loading_pages_.end();
+}
+
+template <typename PageType>
+void buf_pool_t<PageType>::ensure_prefetch_workers() {
+  const uint64_t configured_workers = bw_graph::BW_BUFFER_PREFETCH_WORKER_COUNT;
+  if (configured_workers == 0) {
+    return;
+  }
+
+  std::lock_guard<std::mutex> lk(prefetch_mutex_);
+  if (!prefetch_workers_.empty() || prefetch_stop_) {
+    return;
+  }
+
+  const unsigned int hardware_threads = std::thread::hardware_concurrency();
+  const size_t worker_count =
+      std::max<size_t>(1, std::min<size_t>(configured_workers,
+                                           hardware_threads == 0 ? 4 : hardware_threads));
+  const size_t resident_bound = std::max<size_t>(1, resident_page_count_);
+  prefetch_queue_capacity_ =
+      std::max<size_t>(worker_count * 4, std::min<size_t>(resident_bound, 64));
+  prefetch_workers_.reserve(worker_count);
+  for (size_t i = 0; i < worker_count; ++i) {
+    prefetch_workers_.emplace_back([this] { prefetch_worker_loop(); });
+  }
+}
+
+template <typename PageType>
+void buf_pool_t<PageType>::stop_prefetch_workers() {
+  {
+    std::lock_guard<std::mutex> lk(prefetch_mutex_);
+    prefetch_stop_ = true;
+    if (prefetch_workers_.empty()) {
+      prefetch_queue_.clear();
+      queued_prefetch_pages_.clear();
+      return;
     }
+  }
+  prefetch_cv_.notify_all();
+  for (std::thread& worker : prefetch_workers_) {
+    if (worker.joinable()) {
+      worker.join();
+    }
+  }
+  prefetch_workers_.clear();
+}
+
+template <typename PageType>
+void buf_pool_t<PageType>::prefetch_worker_loop() {
+  while (true) {
+    prefetch_job_t job{};
+    {
+      std::unique_lock<std::mutex> lk(prefetch_mutex_);
+      prefetch_cv_.wait(lk, [&] { return prefetch_stop_ || !prefetch_queue_.empty(); });
+      if (prefetch_stop_ && prefetch_queue_.empty()) {
+        return;
+      }
+      job = prefetch_queue_.front();
+      prefetch_queue_.pop_front();
+      ++prefetch_active_count_;
+    }
+
+    prefetch_page_sync(job.page_no, job.disk_manager);
+
+    {
+      std::lock_guard<std::mutex> lk(prefetch_mutex_);
+      queued_prefetch_pages_.erase(job.page_no);
+      --prefetch_active_count_;
+      if (prefetch_queue_.empty() && prefetch_active_count_ == 0) {
+        prefetch_idle_cv_.notify_all();
+      }
+    }
+  }
+}
+
+template <typename PageType>
+void buf_pool_t<PageType>::prefetch_page_sync(page_no_t page_no, disk_manager_t* disk_manager) {
+  try {
+    PageType* page = buf_page_read(page_no, disk_manager);
     page->r_unlatch();
+    prefetch_completed_.fetch_add(1, std::memory_order_relaxed);
+  } catch (...) {
+    // Prefetch is only a performance hint. Demand reads preserve correctness.
+  }
+}
+
+// Best-effort prefetch: warm the page and release it immediately.
+template <typename PageType>
+void buf_pool_t<PageType>::buf_page_prefetch(page_no_t page_no, disk_manager_t* disk_manager) {
+  prefetches_.fetch_add(1, std::memory_order_relaxed);
+  if (disk_manager == nullptr) {
+    prefetch_dropped_.fetch_add(1, std::memory_order_relaxed);
+    return;
   }
 
-  // Allocate a frame on cache miss.
-  PageType* free_page = nullptr;
-  bool victim_locked = false;
+  if (is_page_cached_or_loading(page_no)) {
+    prefetch_dropped_.fetch_add(1, std::memory_order_relaxed);
+    return;
+  }
 
-  this->lru_latch_.w_lock();
-  this->free_latch_.w_lock();
+  if (bw_graph::BW_BUFFER_PREFETCH_WORKER_COUNT == 0) {
+    prefetch_dropped_.fetch_add(1, std::memory_order_relaxed);
+    return;
+  }
 
-  if (free_head_ == nullptr) {
-    // Evict one page when no free frame exists.
-    free_page = find_victim_page();
-    if (free_page == nullptr) {
-      this->free_latch_.w_unlock();
-      this->lru_latch_.w_unlock();
-      throw std::runtime_error("buf_pool: all pages are pinned, cannot allocate new page");
+  ensure_prefetch_workers();
+  {
+    std::lock_guard<std::mutex> lk(prefetch_mutex_);
+    if (prefetch_workers_.empty() || prefetch_stop_ ||
+        queued_prefetch_pages_.find(page_no) != queued_prefetch_pages_.end() ||
+        prefetch_queue_.size() >= prefetch_queue_capacity_) {
+      prefetch_dropped_.fetch_add(1, std::memory_order_relaxed);
+      return;
     }
-    victim_locked = true;
-    if (free_page->is_dirty()) {
-      disk_manager->write_page(free_page->get_page_no(), free_page->get_data());
+    if (is_page_cached_or_loading(page_no)) {
+      prefetch_dropped_.fetch_add(1, std::memory_order_relaxed);
+      return;
     }
-    remove_from_lru_list(free_page);
-    page_map.erase(free_page->get_page_no());
-    free_page->disable_parse();
-  } else {
-    free_page = free_head_;
-    remove_from_free_list(free_page);
+    queued_prefetch_pages_.insert(page_no);
+    prefetch_queue_.push_back({page_no, disk_manager});
+    prefetch_enqueued_.fetch_add(1, std::memory_order_relaxed);
   }
+  prefetch_cv_.notify_one();
+}
 
-  add_to_lru_head(free_page);
-  if (!victim_locked) {
-    free_page->w_latch();
-  }
-  this->free_latch_.w_unlock();
-  this->lru_latch_.w_unlock();
+template <typename PageType>
+void buf_pool_t<PageType>::wait_for_prefetch_idle() {
+  std::unique_lock<std::mutex> lk(prefetch_mutex_);
+  prefetch_idle_cv_.wait(
+      lk, [&] { return prefetch_queue_.empty() && prefetch_active_count_ == 0; });
+}
 
-  // Load page data into the selected frame.
-  disk_manager->read_page(page_no, free_page->get_data());
-  free_page->set_page_no(page_no);
-  free_page->disable_parse();
-  free_page->self_parse();
-  free_page->set_page_state(PAGE_IN_LRU);
-  free_page->set_referenced(true);
+// Get buffer pool statistics.
+template <typename PageType>
+typename buf_pool_t<PageType>::stats_t buf_pool_t<PageType>::get_stats() const {
+  stats_t stats;
+  stats.cache_hits = cache_hits_.load(std::memory_order_relaxed);
+  stats.cache_misses = cache_misses_.load(std::memory_order_relaxed);
+  stats.duplicate_miss_waits = duplicate_miss_waits_.load(std::memory_order_relaxed);
+  stats.evictions = evictions_.load(std::memory_order_relaxed);
+  stats.dirty_writebacks = dirty_writebacks_.load(std::memory_order_relaxed);
+  stats.prefetches = prefetches_.load(std::memory_order_relaxed);
+  stats.prefetch_enqueued = prefetch_enqueued_.load(std::memory_order_relaxed);
+  stats.prefetch_completed = prefetch_completed_.load(std::memory_order_relaxed);
+  stats.prefetch_dropped = prefetch_dropped_.load(std::memory_order_relaxed);
+  return stats;
+}
 
-  page_map.insert(page_no, free_page);
-  return free_page;
+// Reset buffer pool statistics.
+template <typename PageType>
+void buf_pool_t<PageType>::reset_stats() {
+  cache_hits_.store(0, std::memory_order_relaxed);
+  cache_misses_.store(0, std::memory_order_relaxed);
+  duplicate_miss_waits_.store(0, std::memory_order_relaxed);
+  evictions_.store(0, std::memory_order_relaxed);
+  dirty_writebacks_.store(0, std::memory_order_relaxed);
+  prefetches_.store(0, std::memory_order_relaxed);
+  prefetch_enqueued_.store(0, std::memory_order_relaxed);
+  prefetch_completed_.store(0, std::memory_order_relaxed);
+  prefetch_dropped_.store(0, std::memory_order_relaxed);
 }
 
 // Copy external page data into the buffer pool.
@@ -198,38 +408,7 @@ PageType* buf_pool_t<PageType>::buf_page_cp(page_no_t page_no, char* page_data,
     return nullptr;
   }
 
-  PageType* free_page = nullptr;
-  bool victim_locked = false;
-
-  this->lru_latch_.w_lock();
-  this->free_latch_.w_lock();
-
-  if (free_head_ == nullptr) {
-    // Evict one page when no free frame exists.
-    free_page = find_victim_page();
-    if (free_page == nullptr) {
-      this->free_latch_.w_unlock();
-      this->lru_latch_.w_unlock();
-      throw std::runtime_error("buf_pool: all pages are pinned, cannot allocate new page");
-    }
-    victim_locked = true;
-    if (free_page->is_dirty()) {
-      disk_manager->write_page(free_page->get_page_no(), free_page->get_data());
-    }
-    remove_from_lru_list(free_page);
-    page_map.erase(free_page->get_page_no());
-    free_page->disable_parse();
-  } else {
-    free_page = free_head_;
-    remove_from_free_list(free_page);
-  }
-
-  add_to_lru_head(free_page);
-  if (!victim_locked) {
-    free_page->w_latch();
-  }
-  this->free_latch_.w_unlock();
-  this->lru_latch_.w_unlock();
+  PageType* free_page = claim_frame_for_reuse(disk_manager);
 
   // Copy page data into the selected frame.
   memcpy(free_page->get_data(), page_data, page_size_);
@@ -377,45 +556,13 @@ template <typename PageType>
 // Handle buf page new.
 PageType* buf_pool_t<PageType>::buf_page_new(page_no_t page_no, disk_manager_t* disk_manager) {
   // Return directly on cache hit.
-  auto it = page_map.find(page_no);
-  if (it != page_map.end()) {
-    it->second->set_referenced(true);
-    it->second->w_latch();
-    return it->second;
+  PageType* cached_page = try_latch_cached_page(page_no, true);
+  if (cached_page != nullptr) {
+    cache_hits_.fetch_add(1, std::memory_order_relaxed);
+    return cached_page;
   }
 
-  PageType* free_page = nullptr;
-  bool victim_locked = false;
-
-  this->lru_latch_.w_lock();
-  this->free_latch_.w_lock();
-
-  if (free_head_ == nullptr) {
-    // Evict one page when no free frame exists.
-    free_page = find_victim_page();
-    if (free_page == nullptr) {
-      this->free_latch_.w_unlock();
-      this->lru_latch_.w_unlock();
-      throw std::runtime_error("buf_pool: all pages are pinned, cannot allocate new page");
-    }
-    victim_locked = true;
-    if (free_page->is_dirty()) {
-      disk_manager->write_page(free_page->get_page_no(), free_page->get_data());
-    }
-    remove_from_lru_list(free_page);
-    page_map.erase(free_page->get_page_no());
-    free_page->disable_parse();
-  } else {
-    free_page = free_head_;
-    remove_from_free_list(free_page);
-  }
-
-  add_to_lru_head(free_page);
-  if (!victim_locked) {
-    free_page->w_latch();
-  }
-  this->free_latch_.w_unlock();
-  this->lru_latch_.w_unlock();
+  PageType* free_page = claim_frame_for_reuse(disk_manager);
 
   // Reinitialize the selected frame.
   free_page->reinit(page_no);

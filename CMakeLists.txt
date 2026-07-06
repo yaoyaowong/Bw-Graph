@@ -3,6 +3,7 @@ project(BwGraph)
 
 option(BWGRAPH_NEIGHBOR_COMPRESS "Build with PTV-compressed CSR neighbors" OFF)
 option(BW_GRAPH_ENABLE_TRANSACTION "Enable MVCC transaction support" OFF)
+option(BW_GRAPH_ENABLE_IO_URING "Enable Linux io_uring page I/O backend" OFF)
 
 include(CheckCXXCompilerFlag)
 
@@ -17,6 +18,7 @@ endif()
 message(STATUS "Build: type = ${CMAKE_BUILD_TYPE}")
 message(STATUS "Build: neighbor compression = ${BWGRAPH_NEIGHBOR_COMPRESS}")
 message(STATUS "Build: transaction support = ${BW_GRAPH_ENABLE_TRANSACTION}")
+message(STATUS "Build: requested io_uring support = ${BW_GRAPH_ENABLE_IO_URING}")
 
 set(CMAKE_CXX_FLAGS_DEBUG "-g -O0")
 set(CMAKE_CXX_FLAGS_RELEASE "-O3 -DNDEBUG")
@@ -83,6 +85,30 @@ if(ZLIB_FOUND)
 else()
   message(STATUS "Dependency ZLIB: not found")
 endif()
+
+set(BW_GRAPH_IO_URING_ACTIVE OFF)
+if(BW_GRAPH_ENABLE_IO_URING)
+  if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    find_path(IO_URING_INCLUDE_DIR
+              NAMES liburing.h
+              PATHS /usr/include /usr/local/include)
+    find_library(IO_URING_LIBRARY
+                 NAMES uring
+                 PATHS /usr/lib /usr/lib/x86_64-linux-gnu /usr/local/lib)
+    if(IO_URING_INCLUDE_DIR AND IO_URING_LIBRARY)
+      set(BW_GRAPH_IO_URING_ACTIVE ON)
+      message(STATUS
+              "Dependency liburing: found (library=${IO_URING_LIBRARY}, include=${IO_URING_INCLUDE_DIR})")
+    else()
+      message(FATAL_ERROR
+              "BW_GRAPH_ENABLE_IO_URING=ON requires liburing. Install liburing-dev or rebuild without --uring.")
+    endif()
+  else()
+    message(WARNING "Build: io_uring is Linux-only; disabling BW_GRAPH_ENABLE_IO_URING on this platform")
+    set(BW_GRAPH_ENABLE_IO_URING OFF CACHE BOOL "Enable Linux io_uring page I/O backend" FORCE)
+  endif()
+endif()
+message(STATUS "Build: active io_uring support = ${BW_GRAPH_IO_URING_ACTIVE}")
 
 # Third-party dependencies
 # gflags
@@ -455,6 +481,12 @@ endif()
 
 if(BW_GRAPH_ENABLE_TRANSACTION)
   target_compile_definitions(bwgraph PUBLIC BW_GRAPH_ENABLE_TRANSACTION)
+endif()
+
+if(BW_GRAPH_IO_URING_ACTIVE)
+  target_compile_definitions(bwgraph PUBLIC BW_GRAPH_ENABLE_IO_URING)
+  target_include_directories(bwgraph PRIVATE ${IO_URING_INCLUDE_DIR})
+  target_link_libraries(bwgraph PUBLIC ${IO_URING_LIBRARY})
 endif()
 
 target_include_directories(bwgraph PUBLIC

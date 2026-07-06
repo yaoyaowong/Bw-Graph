@@ -77,6 +77,15 @@ public:
   virtual void read_page(page_no_t page_no, char* page_data);
 
   /**
+   * @brief Return true when this disk manager can use the Linux io_uring backend.
+   *
+   * macOS and default Linux builds always return false. Linux builds compiled
+   * with BW_GRAPH_ENABLE_IO_URING return true only if ring initialization
+   * succeeds at startup.
+   */
+  bool is_io_uring_enabled() const;
+
+  /**
    * @brief Delete a page from the database file and reclaim disk space
    *
    * @param page_no ID of the page to delete
@@ -201,6 +210,9 @@ private:
 
   /* Valid page count: set at startup via backward scan, updated on write */
   std::atomic<uint64_t> valid_page_count_{0};
+
+  /* Linux-only io_uring availability. The actual rings are thread-local. */
+  bool io_uring_supported_{false};
 
   std::filesystem::path log_file_name_;
   std::filesystem::path db_file_name_;
